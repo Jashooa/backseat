@@ -371,19 +371,24 @@ async fn extract_payload() -> Result<PathBuf, Error> {
         let dir = runtime_dir();
         let path = dir.join(format!("backseat-payload-{}.so", prefix));
 
-        // Fast path: file already exists and was written by us in a
-        // previous run.
-        if path.exists() {
-            return Ok(path);
-        }
-
-        // Atomic create with exclusive lock to prevent symlink / race attacks.
-        let mut file = OpenOptions::new()
+        // Atomic create with O_CREAT | O_EXCL | O_NOFOLLOW and mode 0600.
+        // If the file already exists (legitimately from a previous run),
+        // treat AlreadyExists as success.
+        let mut file = match OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
-            .map_err(|e| Error::PayloadExtractFailed(format!("open payload: {e}")))?;
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(path);
+            }
+            Err(e) => {
+                return Err(Error::PayloadExtractFailed(format!("open payload: {e}")));
+            }
+        };
         file.write_all(bytes.as_slice())
             .map_err(|e| Error::PayloadExtractFailed(format!("write payload: {e}")))?;
         drop(file);
