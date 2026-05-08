@@ -851,3 +851,32 @@ extern "C" fn init() {
         std::thread::spawn(ipc_thread);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_fixed_rounds_half_up() {
+        // 1.5 * 256 = 384.0 -> exactly 384
+        assert_eq!(to_fixed(1.5), 384);
+        // 1.501 * 256 = 384.256 -> rounds to 384
+        assert_eq!(to_fixed(1.501), 384);
+        // 1.505 * 256 = 385.28 -> rounds to 385
+        assert_eq!(to_fixed(1.505), 385);
+    }
+
+    #[test]
+    fn monotonic_ms_is_monotonic() {
+        let a = monotonic_ms();
+        let b = monotonic_ms();
+        assert!(b >= a, "monotonic_ms went backwards: {a} -> {b}");
+    }
+
+    #[test]
+    fn next_serial_increments() {
+        let s1 = next_serial();
+        let s2 = next_serial();
+        assert!(s2 > s1, "serial did not increment: {s1} -> {s2}");
+    }
+}

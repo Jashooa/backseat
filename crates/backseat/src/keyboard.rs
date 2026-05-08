@@ -149,3 +149,23 @@ fn ascii_to_key(ch: char) -> Result<Key, Error> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_to_key_recognised() {
+        assert_eq!(ascii_to_key('a').unwrap(), Key::A);
+        assert_eq!(ascii_to_key('A').unwrap(), Key::A);
+        assert_eq!(ascii_to_key('1').unwrap(), Key::Num1);
+        assert_eq!(ascii_to_key(' ').unwrap(), Key::Space);
+    }
+
+    #[test]
+    fn ascii_to_key_unrecognised() {
+        assert!(
+            matches!(ascii_to_key('!'), Err(Error::SocketError(msg)) if msg.contains("unsupported"))
+        );
+    }
+}

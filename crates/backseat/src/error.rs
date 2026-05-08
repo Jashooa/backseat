@@ -182,4 +182,14 @@ mod tests {
         assert_eq!(SocketPhase::Connect.to_string(), "connect");
         assert_eq!(SocketPhase::Handshake.to_string(), "handshake");
     }
+
+    #[test]
+    fn unexpected_wait_status_display() {
+        let e = Error::UnexpectedWaitStatus {
+            pid: 1234,
+            op: PtraceOp::Attach,
+        };
+        assert!(e.to_string().contains("Attach"));
+        assert!(e.to_string().contains("1234"));
+    }
 }

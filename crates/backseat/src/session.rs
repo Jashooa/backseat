@@ -441,4 +441,37 @@ mod tests {
         assert!(json.contains("\"type\":\"hello\""));
         assert!(json.contains("\"protocol_version\":1"));
     }
+
+    #[test]
+    fn response_deserialization_with_kind() {
+        let json =
+            r#"{"status":"error","code":"proxy_not_found","message":"nope","kind":"keyboard"}"#;
+        let resp: Response = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.kind, Some("keyboard".to_string()));
+    }
+
+    #[test]
+    fn response_deserialization_status_with_dispatch_hook() {
+        let json = r#"{"status":"ok","dispatch_hook_installed":false}"#;
+        let resp: Response = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.dispatch_hook_installed, Some(false));
+    }
+
+    #[test]
+    fn map_ipc_error_proxy_not_found_with_kind() {
+        use crate::error::ProxyKind;
+        let e = map_ipc_error("proxy_not_found", "msg", Some("keyboard"));
+        assert!(matches!(
+            e,
+            crate::error::Error::ProxyNotFound {
+                kind: ProxyKind::Keyboard
+            }
+        ));
+    }
+
+    #[test]
+    fn map_ipc_error_proxy_not_found_without_kind() {
+        let e = map_ipc_error("proxy_not_found", "msg", None);
+        assert!(matches!(e, crate::error::Error::SocketError(_)));
+    }
 }
