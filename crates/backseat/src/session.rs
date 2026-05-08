@@ -229,6 +229,12 @@ impl Session {
     /// Explicitly unload the payload and remove the per-PID socket file.
     ///
     /// Consumes `self` so the session cannot be used after unloading.
+    ///
+    /// # Caveat
+    ///
+    /// The payload `.so` is *not* `dlclose`'d — the IPC thread would need to
+    /// shut down first and there is no portable way to wait for a thread in
+    /// another process.  Re-injecting the same PID loads a second copy.
     pub async fn unload(self) -> Result<(), Error> {
         let mut s = self.stream.lock().await;
         send_line(&mut s, &Command::new("unload")).await?;

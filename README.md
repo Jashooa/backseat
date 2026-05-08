@@ -142,6 +142,11 @@ and no attempt is made to conceal the injection.
 - `move_by` is not supported in v0.2 (no cursor position tracking)
 - ASCII-only text input
 - No XWayland support (deferred to v0.3)
+- Multithreaded targets: injection attaches the thread group leader while
+  other threads continue running.  This can deadlock the dynamic loader if
+  another thread is inside `dlopen`/`dlsym` at the moment of injection.
+- PID reuse is possible (but unlikely) between `Session::from_name` resolution
+  and `ptrace::attach`.  Use `Session::new(pid)` when stability is critical.
 
 ## Development
 

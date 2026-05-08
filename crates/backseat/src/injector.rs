@@ -216,6 +216,12 @@ pub fn inject_payload(pid: u32, payload_path: &Path) -> Result<(), Error> {
 ///
 /// If more than one process matches, returns
 /// [`Error::AmbiguousProcessName`](crate::Error::AmbiguousProcessName).
+///
+/// # Caveat
+///
+/// PID reuse between resolution and `ptrace::attach` is possible.  Callers
+/// requiring stronger guarantees should use `pidfd_open` (Linux 5.3+) or
+/// re-verify `/proc/<pid>/comm` after attach succeeds.
 pub fn from_name(name: &str) -> Result<u32, Error> {
     let mut matches = Vec::new();
     let proc = std::fs::read_dir("/proc")
