@@ -8,14 +8,11 @@ fmt:
 	cargo fmt --all
 
 clippy:
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-test: build-payload
+test:
 	cargo test -p backseat --lib
 	cargo test -p backseat --doc
 
-build-payload:
-	cargo build -p backseat-payload
-
-test-all: build-payload
-	cargo test -p backseat
+test-all:
+	cargo test --workspace

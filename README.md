@@ -146,9 +146,6 @@ and no attempt is made to conceal the injection.
 ## Development
 
 ```bash
-# Build the payload first (required by build.rs)
-cargo build -p backseat-payload
-
 # Build / test the workspace
 cargo test --workspace
 cargo fmt --all -- --check

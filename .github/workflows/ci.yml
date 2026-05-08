@@ -19,10 +19,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # The payload must be built before the host crate because
-      # backseat/build.rs embeds libbackseat_payload.so via include_bytes!.
-      - name: Build payload
-        run: cargo build -p backseat-payload
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -35,8 +31,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build payload
-        run: cargo build -p backseat-payload
       - name: Run unit tests
         run: cargo test -p backseat --lib
       - name: Run doc tests

@@ -1,23 +1,9 @@
-//! Build script for `backseat`.
-//!
-//! At compile time this script locates the `libbackseat_payload.so` artifact
-//! produced by the sibling `backseat-payload` crate and sets the
-//! `BACKSEAT_PAYLOAD_PATH` environment variable so that `include_bytes!` can
-//! embed it into the final binary.
-//!
-//! # Workflow
-//!
-//! 1. Build the payload first: `cargo build -p backseat-payload`
-//! 2. Build the host crate: `cargo build -p backseat`
-//!
-//! The script panics with a helpful message if the payload artifact is missing.
-
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
-    let _out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let profile = env::var("PROFILE").unwrap();
     let target = env::var("TARGET").unwrap();
 
@@ -35,8 +21,6 @@ fn main() {
     let payload_path = if payload_path.exists() {
         payload_path
     } else {
-        // Fallback for non-cross-compilation builds where Cargo does not
-        // create a `<target>` subdirectory.
         let fallback = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
             .parent()
             .unwrap()
@@ -48,11 +32,51 @@ fn main() {
         if fallback.exists() {
             fallback
         } else {
-            panic!(
-                "backseat-payload not found at {}. \
-                 Build it first with: cargo build -p backseat-payload",
-                payload_path.display()
-            );
+            // Automatically build the payload if it's missing.
+            // We use a separate target directory to avoid Cargo workspace locks.
+            let mut cmd = Command::new("cargo");
+            cmd.args([
+                "build",
+                "-p",
+                "backseat-payload",
+                "--target",
+                &target,
+            ]);
+            if profile == "release" {
+                cmd.arg("--release");
+            }
+
+            // Set CARGO_TARGET_DIR to a subdirectory of OUT_DIR so we don't
+            // contend with the main workspace lock.
+            cmd.env("CARGO_TARGET_DIR", out_dir.join("payload-target"));
+
+            let status = cmd.status().expect("failed to spawn cargo build for payload");
+            if !status.success() {
+                panic!("backseat-payload build failed");
+            }
+
+            // Try the original path again (cargo may have placed it in the
+            // workspace target dir despite CARGO_TARGET_DIR, depending on
+            // whether a .cargo/config overrides it).
+            if payload_path.exists() {
+                payload_path
+            } else if fallback.exists() {
+                fallback
+            } else {
+                // Try the isolated target dir
+                let isolated = out_dir
+                    .join("payload-target")
+                    .join(&target)
+                    .join(&profile)
+                    .join("libbackseat_payload.so");
+                if isolated.exists() {
+                    isolated
+                } else {
+                    panic!(
+                        "backseat-payload build succeeded but artifact not found at expected locations"
+                    );
+                }
+            }
         }
     };
 
