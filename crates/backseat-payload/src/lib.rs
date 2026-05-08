@@ -209,6 +209,7 @@ unsafe fn proxy_interface_name(proxy: *mut c_void) -> Option<&'static [u8]> {
 /// `display` must be a valid `wl_display *`.
 unsafe fn run_hooks(display: *mut c_void) {
     G_DISPLAY.store(display, Ordering::Release);
+    G_DISPATCH_CALLED.store(true, Ordering::Release);
 
     if !G_INITIAL_SWEEP_DONE.swap(true, Ordering::SeqCst) {
         initial_sweep(display);
@@ -470,6 +471,47 @@ pub unsafe extern "C" fn wl_proxy_destroy(proxy: *mut c_void) {
     }
 }
 
+const WL_MARSHAL_FLAG_DESTROY: u32 = 1 << 0;
+
+/// Shadow for `wl_proxy_marshal_flags`.
+///
+/// Modern apps destroy xdg_toplevel via `wl_proxy_marshal_flags(..., WL_MARSHAL_FLAG_DESTROY)`,
+/// which routes through an internal `wl_proxy_destroy_caller_locks` path that
+/// bypasses the public `wl_proxy_destroy` PLT entry.  We shadow this too so
+/// that destroyed toplevels are pruned from `TOPLEVEL_LISTENERS`.
+///
+/// On x86-64 the System-V ABI places all fixed arguments in registers; any
+/// variadic arguments remain in registers / on the stack and are forwarded
+/// to the real function unchanged.
+///
+/// # Safety
+/// `proxy` must be a valid `wl_proxy *`.
+#[no_mangle]
+pub unsafe extern "C" fn wl_proxy_marshal_flags(
+    proxy: *mut c_void,
+    opcode: u32,
+    interface: *const c_void,
+    version: u32,
+    flags: u32,
+) -> *mut c_void {
+    if flags & WL_MARSHAL_FLAG_DESTROY != 0 {
+        TOPLEVEL_LISTENERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(k, _, _)| *k != proxy as usize);
+    }
+    let real = get_real(b"wl_proxy_marshal_flags\0");
+    if let Some(f) = real {
+        let func = std::mem::transmute::<
+            *mut c_void,
+            unsafe extern "C" fn(*mut c_void, u32, *const c_void, u32, u32) -> *mut c_void,
+        >(f);
+        func(proxy, opcode, interface, version, flags)
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Initial sweep
 // ---------------------------------------------------------------------------
@@ -581,12 +623,12 @@ fn make_hello_ack() -> String {
     r#"{"type":"hello_ack","protocol_version":1,"payload_version":"0.2.2"}"#.to_string() + "\n"
 }
 
-/// Build the status response used to report whether the dispatch hook has
-/// been installed.
-fn make_status(dispatch_called: bool) -> String {
+/// Build the status response used to report whether PLT interposition is
+/// active.
+fn make_status() -> String {
     format!(
         r#"{{"status":"ok","dispatch_hook_installed":{}}}"#,
-        dispatch_called
+        G_INTERPOSITION_OK.load(Ordering::Acquire)
     ) + "\n"
 }
 
@@ -802,7 +844,7 @@ fn handle_request(line: &str) -> String {
             make_ok()
         }
         "unload" => make_ok(),
-        "status" => make_status(G_DISPATCH_CALLED.load(Ordering::Acquire)),
+        "status" => make_status(),
         _ => make_error("unknown_command", "unrecognized request type", None),
     }
 }
@@ -876,14 +918,28 @@ fn ipc_thread() {
 #[link_section = ".init_array"]
 static CONSTRUCTOR: extern "C" fn() = init;
 
+/// Set to `true` if the init() self-check confirms that our PLT shadow
+/// symbols are visible to the dynamic linker.
+static G_INTERPOSITION_OK: AtomicBool = AtomicBool::new(false);
+
 extern "C" fn init() {
     if IPC_THREAD_STARTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        // Mark hooks as installed.  The PLT shadows are already in place
-        // because this `.so` is loaded into the target's address space.
-        G_DISPATCH_CALLED.store(true, Ordering::Release);
+        // Self-check: ask the dynamic linker to resolve "wl_display_dispatch".
+        // If it returns OUR function, PLT interposition is working for future
+        // dispatches.  (For BIND_NOW targets the PLT was already resolved and
+        // this check may still return our address — the only definitive test
+        // is whether run_hooks fires, tracked by G_DISPATCH_CALLED.)
+        let sym = unsafe {
+            libc::dlsym(
+                libc::RTLD_DEFAULT,
+                b"wl_display_dispatch\0".as_ptr() as *const i8,
+            )
+        };
+        let ours = wl_display_dispatch as *const () as usize as *mut c_void;
+        G_INTERPOSITION_OK.store(sym == ours, Ordering::Release);
         std::thread::spawn(ipc_thread);
     }
 }
