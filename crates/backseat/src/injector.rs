@@ -22,6 +22,35 @@ use nix::unistd::Pid;
 use crate::error::{Error, PtraceOp};
 
 // ---------------------------------------------------------------------------
+// Ptrace guard — ensures detach on scope exit unless explicitly defused.
+// ---------------------------------------------------------------------------
+
+struct PtraceGuard {
+    pid: Pid,
+    defused: bool,
+}
+
+impl PtraceGuard {
+    fn new(pid: Pid) -> Self {
+        Self {
+            pid,
+            defused: false,
+        }
+    }
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for PtraceGuard {
+    fn drop(&mut self) {
+        if !self.defused {
+            let _ = ptrace::detach(self.pid, None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -47,10 +76,17 @@ pub fn inject_payload(pid: u32, payload_path: &Path) -> Result<(), Error> {
     let pid_nix = Pid::from_raw(pid as i32);
 
     // 1. Attach
-    ptrace::attach(pid_nix).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::Attach,
-        errno: errno_from_nix(e),
+    ptrace::attach(pid_nix).map_err(|e| {
+        let errno = errno_from_nix(e);
+        if errno == libc::EPERM {
+            Error::PermissionDenied(pid)
+        } else {
+            Error::PtraceFailed {
+                pid,
+                op: PtraceOp::Attach,
+                errno,
+            }
+        }
     })?;
 
     let status = waitpid(pid_nix, None).map_err(|e| Error::PtraceFailed {
@@ -59,13 +95,14 @@ pub fn inject_payload(pid: u32, payload_path: &Path) -> Result<(), Error> {
         errno: errno_from_nix(e),
     })?;
     if !matches!(status, WaitStatus::Stopped(_, Signal::SIGSTOP)) {
-        let _ = ptrace::detach(pid_nix, None);
         return Err(Error::PtraceFailed {
             pid,
             op: PtraceOp::Attach,
             errno: -1,
         });
     }
+
+    let mut guard = PtraceGuard::new(pid_nix);
 
     // 2. Save registers
     let orig_regs = ptrace::getregs(pid_nix).map_err(|e| Error::PtraceFailed {
@@ -93,70 +130,81 @@ pub fn inject_payload(pid: u32, payload_path: &Path) -> Result<(), Error> {
     let orig_path = read_bytes(pid, path_addr, path_bytes.len())?;
     let orig_code = read_bytes(pid, code_addr, shellcode.len())?;
 
-    write_bytes(pid, path_addr, path_bytes)?;
-    write_bytes(pid, code_addr, &shellcode)?;
+    let inject_result: Result<(), Error> = (|| {
+        write_bytes(pid, path_addr, path_bytes)?;
+        write_bytes(pid, code_addr, &shellcode)?;
 
-    // 5. Set registers for shellcode execution
-    let mut regs = orig_regs;
-    regs.rip = code_addr;
-    regs.rdi = path_addr;
-    regs.rsi = (libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64;
-    regs.rsp = scratch;
-    ptrace::setregs(pid_nix, regs).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::SetRegs,
-        errno: errno_from_nix(e),
-    })?;
+        // 5. Set registers for shellcode execution
+        let mut regs = orig_regs;
+        regs.rip = code_addr;
+        regs.rdi = path_addr;
+        regs.rsi = (libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64;
+        regs.rsp = scratch;
+        ptrace::setregs(pid_nix, regs).map_err(|e| Error::PtraceFailed {
+            pid,
+            op: PtraceOp::SetRegs,
+            errno: errno_from_nix(e),
+        })?;
 
-    // 6. Continue until INT3 (SIGTRAP)
-    ptrace::cont(pid_nix, None).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::Cont,
-        errno: errno_from_nix(e),
-    })?;
-
-    let status = waitpid(pid_nix, None).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::Cont,
-        errno: errno_from_nix(e),
-    })?;
-    if !matches!(status, WaitStatus::Stopped(_, Signal::SIGTRAP)) {
-        let _ = ptrace::detach(pid_nix, None);
-        return Err(Error::PtraceFailed {
+        // 6. Continue until INT3 (SIGTRAP)
+        ptrace::cont(pid_nix, None).map_err(|e| Error::PtraceFailed {
             pid,
             op: PtraceOp::Cont,
-            errno: -1,
-        });
-    }
+            errno: errno_from_nix(e),
+        })?;
 
-    // 7. Read RAX (dlopen handle)
-    let post_regs = ptrace::getregs(pid_nix).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::GetRegs,
-        errno: errno_from_nix(e),
-    })?;
-    if post_regs.rax == 0 {
-        let _ = ptrace::detach(pid_nix, None);
-        return Err(Error::DlopenReturnedNull { pid });
-    }
+        let status = waitpid(pid_nix, None).map_err(|e| Error::PtraceFailed {
+            pid,
+            op: PtraceOp::Cont,
+            errno: errno_from_nix(e),
+        })?;
+        if !matches!(status, WaitStatus::Stopped(_, Signal::SIGTRAP)) {
+            return Err(Error::PtraceFailed {
+                pid,
+                op: PtraceOp::Cont,
+                errno: -1,
+            });
+        }
 
-    // 8. Restore original bytes and registers
-    write_bytes(pid, path_addr, &orig_path)?;
-    write_bytes(pid, code_addr, &orig_code)?;
-    ptrace::setregs(pid_nix, orig_regs).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::SetRegs,
-        errno: errno_from_nix(e),
-    })?;
+        // 7. Read RAX (dlopen handle)
+        let post_regs = ptrace::getregs(pid_nix).map_err(|e| Error::PtraceFailed {
+            pid,
+            op: PtraceOp::GetRegs,
+            errno: errno_from_nix(e),
+        })?;
+        if post_regs.rax == 0 {
+            return Err(Error::DlopenReturnedNull { pid });
+        }
+
+        // 8. Restore original bytes and registers
+        write_bytes(pid, path_addr, &orig_path)?;
+        write_bytes(pid, code_addr, &orig_code)?;
+        ptrace::setregs(pid_nix, orig_regs).map_err(|e| Error::PtraceFailed {
+            pid,
+            op: PtraceOp::SetRegs,
+            errno: errno_from_nix(e),
+        })?;
+
+        Ok(())
+    })();
+
+    if inject_result.is_err() {
+        // Best-effort restore of stack bytes so the target isn't left
+        // with shellcode or path data on its stack.
+        let _ = write_bytes(pid, path_addr, &orig_path);
+        let _ = write_bytes(pid, code_addr, &orig_code);
+        let _ = ptrace::setregs(pid_nix, orig_regs);
+    }
 
     // 9. Detach
+    guard.defuse();
     ptrace::detach(pid_nix, None).map_err(|e| Error::PtraceFailed {
         pid,
         op: PtraceOp::Detach,
         errno: errno_from_nix(e),
     })?;
 
-    Ok(())
+    inject_result
 }
 
 /// Resolve a human-readable process name to a PID by scanning `/proc`.
@@ -221,19 +269,21 @@ pub fn from_name(name: &str) -> Result<u32, Error> {
 /// 2. Read the on-disk libc binary.
 /// 3. Parse ELF dynamic symbol table (`.dynsym`) for `dlopen` or
 ///    `__libc_dlopen_mode`.
-/// 4. Compute `target_base + symbol_offset`.
-/// 5. Verify by `PTRACE_PEEKTEXT` — read a word at the computed address and
+/// 4. Walk program headers to translate the symbol's virtual address to a
+///    file offset (not architecturally guaranteed to equal `st_value`).
+/// 5. Compute `target_base + symbol_vaddr`.
+/// 6. Verify by `PTRACE_PEEKTEXT` — read a word at the computed address and
 ///    compare with the on-disk bytes.
 fn resolve_dlopen(pid: u32) -> Result<u64, Error> {
     let (base, path) = find_libc_mapping(pid)?;
     let data =
         std::fs::read(&path).map_err(|e| Error::PayloadExtractFailed(format!("read libc: {e}")))?;
 
-    let offset = find_symbol_offset(&data, "dlopen")
+    let (sym_vaddr, file_offset) = find_symbol_offset(&data, "dlopen")
         .or_else(|| find_symbol_offset(&data, "__libc_dlopen_mode"))
         .ok_or(Error::LibcResolutionFailed { pid })?;
 
-    let addr = base + offset;
+    let addr = base + sym_vaddr;
 
     // Verify by peeking a few bytes at the computed address.
     let pid_nix = Pid::from_raw(pid as i32);
@@ -242,7 +292,11 @@ fn resolve_dlopen(pid: u32) -> Result<u64, Error> {
         op: PtraceOp::PokeData,
         errno: errno_from_nix(e),
     })? as u64;
-    let disk_bytes = &data[offset as usize..offset as usize + 8];
+    let off = file_offset as usize;
+    let disk_bytes = &data[off..off.saturating_add(8).min(data.len())];
+    if disk_bytes.len() < 8 {
+        return Err(Error::LibcResolutionFailed { pid });
+    }
     let disk_word = u64::from_le_bytes([
         disk_bytes[0],
         disk_bytes[1],
@@ -271,10 +325,15 @@ fn find_libc_mapping(pid: u32) -> Result<(u64, String), Error> {
             continue;
         }
         let path = parts[5];
-        if path.contains("libc") || path.contains("ld-musl") {
-            if !path.ends_with(".so") && !path.contains(".so.") {
-                continue;
-            }
+        let basename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+        let is_libc = basename.starts_with("libc.so")
+            || basename.starts_with("libc-")
+            || basename.starts_with("libc.musl-");
+        let is_musl = basename.starts_with("ld-musl-");
+        if (is_libc || is_musl) && (path.ends_with(".so") || path.contains(".so.")) {
             let addr_str = parts[0].split('-').next().unwrap_or("");
             let base = u64::from_str_radix(addr_str, 16)
                 .map_err(|_| Error::LibcResolutionFailed { pid })?;
@@ -284,26 +343,33 @@ fn find_libc_mapping(pid: u32) -> Result<(u64, String), Error> {
     Err(Error::LibcResolutionFailed { pid })
 }
 
-/// Parse an ELF file in memory and return the offset of `name` in the
-/// dynamic symbol table (`.dynsym`), falling back to the full symbol table.
-fn find_symbol_offset(data: &[u8], name: &str) -> Option<u64> {
+/// Parse an ELF file in memory and return the symbol's virtual address
+/// together with its file offset (translated via program headers).
+fn find_symbol_offset(data: &[u8], name: &str) -> Option<(u64, u64)> {
     match Object::parse(data).ok()? {
         Object::Elf(elf) => {
-            for sym in &elf.dynsyms {
-                if let Some(sym_name) = elf.dynstrtab.get_at(sym.st_name) {
-                    if sym_name == name {
-                        return Some(sym.st_value);
-                    }
+            let sym = elf
+                .dynsyms
+                .iter()
+                .find(|sym| elf.dynstrtab.get_at(sym.st_name) == Some(name))
+                .or_else(|| {
+                    elf.syms
+                        .iter()
+                        .find(|sym| elf.strtab.get_at(sym.st_name) == Some(name))
+                })?;
+
+            let vaddr = sym.st_value;
+            // Translate virtual address to file offset via program headers.
+            let file_offset = elf.program_headers.iter().find_map(|ph| {
+                if ph.p_type == goblin::elf::program_header::PT_LOAD
+                    && vaddr >= ph.p_vaddr
+                    && vaddr < ph.p_vaddr + ph.p_filesz
+                {
+                    return Some(vaddr - ph.p_vaddr + ph.p_offset);
                 }
-            }
-            for sym in &elf.syms {
-                if let Some(sym_name) = elf.strtab.get_at(sym.st_name) {
-                    if sym_name == name {
-                        return Some(sym.st_value);
-                    }
-                }
-            }
-            None
+                None
+            })?;
+            Some((vaddr, file_offset))
         }
         _ => None,
     }
@@ -365,18 +431,40 @@ fn read_bytes(pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, Error> {
 }
 
 /// Write `bytes` into the target process at `addr` via `PTRACE_POKEDATA`.
+///
+/// For the final partial chunk a read-modify-write is performed so that
+/// trailing bytes of the target word are preserved.
 fn write_bytes(pid: u32, addr: u64, bytes: &[u8]) -> Result<(), Error> {
     let pid_nix = Pid::from_raw(pid as i32);
     for (i, chunk) in bytes.chunks(8).enumerate() {
-        let mut word: u64 = 0;
-        for (j, &b) in chunk.iter().enumerate() {
-            word |= (b as u64) << (j * 8);
-        }
-        let target_addr = (addr + (i * 8) as u64) as *mut c_void;
-        ptrace::write(pid_nix, target_addr, word as i64).map_err(|e| {
+        let target_addr = addr + (i * 8) as u64;
+        let word = if chunk.len() == 8 {
+            // Full word — just pack the bytes.
+            let mut w: u64 = 0;
+            for (j, &b) in chunk.iter().enumerate() {
+                w |= (b as u64) << (j * 8);
+            }
+            w
+        } else {
+            // Partial word — read-modify-write to preserve trailing bytes.
+            let existing = ptrace::read(pid_nix, target_addr as *mut c_void).map_err(|e| {
+                Error::ShellcodeWriteFailed {
+                    pid,
+                    addr: target_addr,
+                    errno: errno_from_nix(e),
+                }
+            })? as u64;
+            let mut w = existing;
+            for (j, &b) in chunk.iter().enumerate() {
+                let mask = 0xFFu64 << (j * 8);
+                w = (w & !mask) | ((b as u64) << (j * 8));
+            }
+            w
+        };
+        ptrace::write(pid_nix, target_addr as *mut c_void, word as i64).map_err(|e| {
             Error::ShellcodeWriteFailed {
                 pid,
-                addr: addr + (i * 8) as u64,
+                addr: target_addr,
                 errno: errno_from_nix(e),
             }
         })?;
