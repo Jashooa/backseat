@@ -146,13 +146,15 @@ and no attempt is made to conceal the injection.
 ## Development
 
 ```bash
-# Build / test the workspace
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+# Everything in one go: format, lint, and test
+make all
 
-# Or use the Makefile
-make test
+# Individual steps
+make fmt          # apply formatting
+make clippy       # lint with clippy
+make test         # unit + doc tests (integration tests are skipped)
+make integration  # run integration tests (requires Wayland + ptrace)
+make test-all     # test entire workspace
 ```
 
 ## License
