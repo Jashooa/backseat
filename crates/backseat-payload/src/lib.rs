@@ -217,7 +217,7 @@ unsafe fn run_hooks(display: *mut c_void) {
 
     // Drain queued async commands.
     let cmds = {
-        let mut q = COMMAND_QUEUE.lock().unwrap();
+        let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *q)
     };
     for cmd in cmds {
@@ -338,19 +338,16 @@ pub unsafe extern "C" fn wl_seat_get_keyboard(seat: *mut c_void) -> *mut c_void 
 // xdg_toplevel configure shim
 // ---------------------------------------------------------------------------
 
-/// Original `configure` callback pointer for the application's
-/// `xdg_toplevel_listener`.
-static ORIG_TOPLEVEL_CONFIGURE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Original `data` pointer passed to `xdg_toplevel_add_listener`.
-static ORIG_TOPLEVEL_DATA: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// Per-toplevel saved listener state: `(original_configure_fn, user_data)`.
+/// Stored as `usize` because raw pointers are not `Send`.
+static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
 /// Shim that wraps the app's `xdg_toplevel_listener.configure`.
 ///
 /// Updates `G_SURFACE_W` / `G_SURFACE_H` atomically, then forwards to the
 /// original listener so the application continues to work normally.
 extern "C" fn toplevel_configure_shim(
-    data: *mut c_void,
+    _data: *mut c_void,
     toplevel: *mut c_void,
     width: i32,
     height: i32,
@@ -362,16 +359,19 @@ extern "C" fn toplevel_configure_shim(
     if height > 0 {
         G_SURFACE_H.store(height as u32, Ordering::Release);
     }
-    let orig = ORIG_TOPLEVEL_CONFIGURE.load(Ordering::Acquire);
-    if !orig.is_null() {
-        // SAFETY: `orig` was saved from a valid listener function pointer.
-        let func = unsafe {
-            std::mem::transmute::<
-                *mut c_void,
-                extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void),
-            >(orig)
-        };
-        func(data, toplevel, width, height, states);
+    let key = toplevel as usize;
+    let listeners = TOPLEVEL_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, orig, orig_data)) = listeners.iter().find(|(k, _, _)| *k == key) {
+        if orig != 0 {
+            // SAFETY: `orig` was saved from a valid listener function pointer.
+            let func = unsafe {
+                std::mem::transmute::<
+                    usize,
+                    extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void),
+                >(orig)
+            };
+            func(orig_data as *mut c_void, toplevel, width, height, states);
+        }
     }
 }
 
@@ -408,8 +408,10 @@ pub unsafe extern "C" fn wl_proxy_add_listener(
                 std::ptr::copy_nonoverlapping(implementation, shim, event_count);
                 let orig_configure = *shim;
                 if !orig_configure.is_null() {
-                    ORIG_TOPLEVEL_CONFIGURE.store(orig_configure, Ordering::Release);
-                    ORIG_TOPLEVEL_DATA.store(data, Ordering::Release);
+                    TOPLEVEL_LISTENERS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((proxy as usize, orig_configure as usize, data as usize));
                     *shim = toplevel_configure_shim as *mut c_void;
                 }
                 let result = match real {
@@ -562,7 +564,7 @@ fn make_status(dispatch_called: bool) -> String {
 /// Convert a floating-point value to Wayland's signed 24.8 fixed-point
 /// (`wl_fixed_t`).
 fn to_fixed(v: f64) -> i32 {
-    (v * 256.0) as i32
+    (v * 256.0).round() as i32
 }
 
 /// Monotonically-increasing serial counter used for synthetic button/key
@@ -571,6 +573,22 @@ static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 fn next_serial() -> u32 {
     SERIAL_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Return a `CLOCK_MONOTONIC` timestamp in milliseconds, suitable for
+/// Wayland event timestamps.
+fn monotonic_ms() -> u32 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-param.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000_000) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -626,7 +644,7 @@ unsafe fn dispatch_mouse_move(x: f64, y: f64) {
         extern "C" fn(*mut c_void, *mut c_void, u32, i32, i32),
     >(func_ptr);
     let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = libc::time(std::ptr::null_mut()) as u32;
+    let time = monotonic_ms();
     motion(data, proxy, time, to_fixed(x), to_fixed(y));
 }
 
@@ -644,7 +662,7 @@ unsafe fn dispatch_mouse_button(button: u32, pressed: bool) {
         extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32),
     >(func_ptr);
     let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = libc::time(std::ptr::null_mut()) as u32;
+    let time = monotonic_ms();
     let state = if pressed { 1 } else { 0 };
     func(data, proxy, next_serial(), time, button, state);
 }
@@ -663,7 +681,7 @@ unsafe fn dispatch_key(key: u32, pressed: bool) {
         extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32),
     >(func_ptr);
     let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = libc::time(std::ptr::null_mut()) as u32;
+    let time = monotonic_ms();
     let state = if pressed { 1 } else { 0 };
     func(data, proxy, next_serial(), time, key, state);
 }
@@ -682,7 +700,7 @@ unsafe fn dispatch_scroll(axis: u32, value: f64) {
         extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32),
     >(func_ptr);
     let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = libc::time(std::ptr::null_mut()) as u32;
+    let time = monotonic_ms();
     func(data, proxy, time, axis, to_fixed(value));
 }
 
@@ -759,7 +777,10 @@ fn handle_request(line: &str) -> String {
 /// Push a command into the queue that will be drained by the next
 /// `wl_display_dispatch` call.
 fn queue_cmd(cmd: IpcCommand) -> String {
-    COMMAND_QUEUE.lock().unwrap().push_back(cmd);
+    COMMAND_QUEUE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(cmd);
     make_ok()
 }
 
