@@ -386,7 +386,7 @@ fn write_bytes(pid: u32, addr: u64, bytes: &[u8]) -> Result<(), Error> {
 
 /// Convert a nix error to a raw `errno` integer.
 fn errno_from_nix(e: nix::Error) -> i32 {
-    // In nix 0.28, `nix::Error` is `nix::errno::Errno`.
+    // nix::Error is a type alias for nix::errno::Errno.
     e as i32
 }
 
