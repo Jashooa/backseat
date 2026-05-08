@@ -325,7 +325,11 @@ fn resolve_dlopen(pid: u32) -> Result<u64, Error> {
 fn find_libc_mapping(pid: u32) -> Result<(u64, String), Error> {
     let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid))
         .map_err(|e| Error::PayloadExtractFailed(format!("read maps: {e}")))?;
+    find_libc_mapping_in(&maps, pid)
+}
 
+/// Parse a `/proc/<pid>/maps` string and return the first libc mapping.
+fn find_libc_mapping_in(maps: &str, pid: u32) -> Result<(u64, String), Error> {
     for line in maps.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 6 {
@@ -350,6 +354,22 @@ fn find_libc_mapping(pid: u32) -> Result<(u64, String), Error> {
     Err(Error::LibcResolutionFailed { pid })
 }
 
+/// Translate a virtual address to a file offset using ELF program headers.
+fn vaddr_to_file_offset(
+    phs: &[goblin::elf::program_header::ProgramHeader],
+    vaddr: u64,
+) -> Option<u64> {
+    phs.iter().find_map(|ph| {
+        if ph.p_type == goblin::elf::program_header::PT_LOAD
+            && vaddr >= ph.p_vaddr
+            && vaddr < ph.p_vaddr + ph.p_filesz
+        {
+            return Some(vaddr - ph.p_vaddr + ph.p_offset);
+        }
+        None
+    })
+}
+
 /// Parse an ELF file in memory and return the symbol's virtual address
 /// together with its file offset (translated via program headers).
 fn find_symbol_offset(data: &[u8], name: &str) -> Option<(u64, u64)> {
@@ -366,16 +386,7 @@ fn find_symbol_offset(data: &[u8], name: &str) -> Option<(u64, u64)> {
                 })?;
 
             let vaddr = sym.st_value;
-            // Translate virtual address to file offset via program headers.
-            let file_offset = elf.program_headers.iter().find_map(|ph| {
-                if ph.p_type == goblin::elf::program_header::PT_LOAD
-                    && vaddr >= ph.p_vaddr
-                    && vaddr < ph.p_vaddr + ph.p_filesz
-                {
-                    return Some(vaddr - ph.p_vaddr + ph.p_offset);
-                }
-                None
-            })?;
+            let file_offset = vaddr_to_file_offset(&elf.program_headers, vaddr)?;
             Some((vaddr, file_offset))
         }
         _ => None,
@@ -525,83 +536,78 @@ mod tests {
     fn find_libc_mapping_rejects_libcaca() {
         let maps = "7f8b0000-7f8b1000 r-xp 00000000 00:00 0                          /usr/lib/libcaca.so\n\
                     7f8b1000-7f8b2000 r-xp 00000000 00:00 0                          /usr/lib/libc.so.6\n";
-        // find_libc_mapping is private, so we test via resolve_dlopen by
-        // mocking the maps content indirectly.  Instead, expose a thin test
-        // helper that parses a string.
-        let result = find_libc_mapping_from_str(1234, maps);
+        let result = find_libc_mapping_in(maps, 1234);
         assert!(result.is_ok());
         let (_, path) = result.unwrap();
         assert!(path.ends_with("libc.so.6"), "got: {}", path);
     }
 
     #[test]
+    fn vaddr_to_file_offset_hits_and_misses() {
+        use goblin::elf::program_header::ProgramHeader;
+        // PT_LOAD covering vaddr 0x1000..0x2000, file offset 0x0
+        let ph = ProgramHeader {
+            p_type: goblin::elf::program_header::PT_LOAD,
+            p_flags: goblin::elf::program_header::PF_R | goblin::elf::program_header::PF_X,
+            p_offset: 0,
+            p_vaddr: 0x1000,
+            p_paddr: 0x1000,
+            p_filesz: 0x1000,
+            p_memsz: 0x1000,
+            p_align: 0x1000,
+        };
+        // vaddr inside the segment -> translates to file offset
+        assert_eq!(
+            vaddr_to_file_offset(std::slice::from_ref(&ph), 0x1004),
+            Some(0x4)
+        );
+        assert_eq!(
+            vaddr_to_file_offset(std::slice::from_ref(&ph), 0x1FFF),
+            Some(0xFFF)
+        );
+        // vaddr below the segment -> None
+        assert_eq!(vaddr_to_file_offset(std::slice::from_ref(&ph), 0x0), None);
+        // vaddr at the exact upper bound -> None (half-open interval)
+        assert_eq!(
+            vaddr_to_file_offset(std::slice::from_ref(&ph), 0x2000),
+            None
+        );
+    }
+
+    #[test]
     fn find_symbol_offset_rejects_uncovered_vaddr() {
-        // Build a minimal 64-bit ELF with a .dynsym symbol whose st_value
-        // falls outside every PT_LOAD segment.
+        // A real ELF may have a symbol whose st_value is not covered by any
+        // PT_LOAD.  Since constructing a hand-rolled ELF with a dynsym is
+        // complex, we test the lower-level vaddr_to_file_offset helper above
+        // and simply verify that find_symbol_offset returns None for an ELF
+        // that has no matching symbol name.
         let mut data = Vec::new();
-        // ELF header
-        data.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]); // magic + 64-bit, little, current, SYSV
-        data.extend_from_slice(&[0u8; 8]); // padding
-        data.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
-        data.extend_from_slice(&0x3eu16.to_le_bytes()); // e_machine = x86_64
-        data.extend_from_slice(&1u32.to_le_bytes()); // e_version
-        data.extend_from_slice(&0u64.to_le_bytes()); // e_entry
-        data.extend_from_slice(&64u64.to_le_bytes()); // e_phoff (right after ELF header)
-        data.extend_from_slice(&0u64.to_le_bytes()); // e_shoff (no sections)
-        data.extend_from_slice(&0u32.to_le_bytes()); // e_flags
-        data.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
-        data.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
-        data.extend_from_slice(&1u16.to_le_bytes()); // e_phnum (1 program header)
-        data.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
-        data.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
-        data.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
-                                                     // PT_LOAD program header — covers 0x1000..0x2000
-        data.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
-        data.extend_from_slice(&5u32.to_le_bytes()); // p_flags = PF_R | PF_X
-        data.extend_from_slice(&0u64.to_le_bytes()); // p_offset
-        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_vaddr
-        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_paddr
-        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_filesz
-        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
-        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
-                                                          // Pad to 64 bytes (ELF header size)
+        data.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+        data.extend_from_slice(&[0u8; 8]);
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&0x3eu16.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&64u64.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&64u16.to_le_bytes());
+        data.extend_from_slice(&56u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&0x1000u64.to_le_bytes());
+        data.extend_from_slice(&0x1000u64.to_le_bytes());
+        data.extend_from_slice(&0x1000u64.to_le_bytes());
+        data.extend_from_slice(&0x1000u64.to_le_bytes());
+        data.extend_from_slice(&0x1000u64.to_le_bytes());
         while data.len() < 64 {
             data.push(0);
         }
-        // Add a fake .dynsym section at file offset 64 (not needed for this test,
-        // but we need a dynsym to parse).  Actually, find_symbol_offset uses
-        // goblin::Object::parse which reads section headers.  Without section
-        // headers pointing to .dynsym, goblin won't find any dynamic symbols.
-        // This test is tricky to construct by hand.  Let's use a simpler approach:
-        // verify that find_symbol_offset returns None for a valid ELF that has
-        // no matching symbol name.
         assert!(find_symbol_offset(&data, "dlopen").is_none());
-    }
-
-    /// Thin test-only wrapper around `find_libc_mapping` that accepts a
-    /// string instead of reading `/proc/<pid>/maps`.
-    fn find_libc_mapping_from_str(pid: u32, maps: &str) -> Result<(u64, String), Error> {
-        for line in maps.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 6 {
-                continue;
-            }
-            let path = parts[5];
-            let basename = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path);
-            let is_libc = basename.starts_with("libc.so")
-                || basename.starts_with("libc-")
-                || basename.starts_with("libc.musl-");
-            let is_musl = basename.starts_with("ld-musl-");
-            if (is_libc || is_musl) && (path.ends_with(".so") || path.contains(".so.")) {
-                let addr_str = parts[0].split('-').next().unwrap_or("");
-                let base = u64::from_str_radix(addr_str, 16)
-                    .map_err(|_| Error::LibcResolutionFailed { pid })?;
-                return Ok((base, path.to_string()));
-            }
-        }
-        Err(Error::LibcResolutionFailed { pid })
     }
 }
