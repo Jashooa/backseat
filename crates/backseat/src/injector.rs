@@ -373,18 +373,13 @@ fn write_bytes(pid: u32, addr: u64, bytes: &[u8]) -> Result<(), Error> {
             word |= (b as u64) << (j * 8);
         }
         let target_addr = (addr + (i * 8) as u64) as *mut c_void;
-        // SAFETY: ptrace::write is unsafe because it manipulates another
-        // process's memory. We only write to the scratch area on the target
-        // stack that we have verified is writable.
-        unsafe {
-            ptrace::write(pid_nix, target_addr, word as *mut c_void).map_err(|e| {
-                Error::ShellcodeWriteFailed {
-                    pid,
-                    addr: addr + (i * 8) as u64,
-                    errno: errno_from_nix(e),
-                }
-            })?;
-        }
+        ptrace::write(pid_nix, target_addr, word as i64).map_err(|e| {
+            Error::ShellcodeWriteFailed {
+                pid,
+                addr: addr + (i * 8) as u64,
+                errno: errno_from_nix(e),
+            }
+        })?;
     }
     Ok(())
 }

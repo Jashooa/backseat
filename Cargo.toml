@@ -6,7 +6,7 @@ resolver = "2"
 version = "0.2.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/backseat"
+repository = "https://github.com/Jashooa/backseat"
 rust-version = "1.75"
 
 [profile.release]

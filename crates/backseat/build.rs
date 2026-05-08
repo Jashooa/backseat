@@ -35,13 +35,7 @@ fn main() {
             // Automatically build the payload if it's missing.
             // We use a separate target directory to avoid Cargo workspace locks.
             let mut cmd = Command::new("cargo");
-            cmd.args([
-                "build",
-                "-p",
-                "backseat-payload",
-                "--target",
-                &target,
-            ]);
+            cmd.args(["build", "-p", "backseat-payload", "--target", &target]);
             if profile == "release" {
                 cmd.arg("--release");
             }
@@ -50,7 +44,9 @@ fn main() {
             // contend with the main workspace lock.
             cmd.env("CARGO_TARGET_DIR", out_dir.join("payload-target"));
 
-            let status = cmd.status().expect("failed to spawn cargo build for payload");
+            let status = cmd
+                .status()
+                .expect("failed to spawn cargo build for payload");
             if !status.success() {
                 panic!("backseat-payload build failed");
             }
