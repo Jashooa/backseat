@@ -1,6 +1,6 @@
 # Local development helpers
 
-.PHONY: all fmt clippy test test-all integration
+.PHONY: all fmt clippy test test-all integration setup-hooks
 
 all: fmt clippy test
 
@@ -18,3 +18,6 @@ integration:
 
 test-all:
 	cargo test --workspace
+
+setup-hooks:
+	ln -sf "$(PWD)/scripts/pre-commit" "$(PWD)/.git/hooks/pre-commit"

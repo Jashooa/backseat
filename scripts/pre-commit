@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pre-commit hook: format check, lint, and test.
+# Skip with: SKIP_PRECOMMIT=1 git commit …
+# Skip with: git commit --no-verify
+
+if [[ "${SKIP_PRECOMMIT:-}" == "1" ]]; then
+    exit 0
+fi
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+step()  { echo -e "\n${YELLOW}==>${NC} ${1}"; }
+ok()    { echo -e "  ${GREEN}PASS${NC} ${1}"; }
+fail()  { echo -e "  ${RED}FAIL${NC} ${1}"; exit 1; }
+
+# ── fmt ────────────────────────────────────────────────────────────────
+step "cargo fmt --all -- --check"
+if cargo fmt --all -- --check 2>&1; then
+    ok "fmt"
+else
+    fail "Run 'make fmt' to apply formatting."
+fi
+
+# ── clippy ─────────────────────────────────────────────────────────────
+step "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+if cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1; then
+    ok "clippy"
+else
+    fail "Fix clippy warnings before committing."
+fi
+
+# ── test ───────────────────────────────────────────────────────────────
+step "cargo test -p backseat"
+if cargo test -p backseat 2>&1; then
+    ok "tests"
+else
+    fail "Tests failed."
+fi
+
+echo -e "\n${GREEN}All checks passed.${NC}"

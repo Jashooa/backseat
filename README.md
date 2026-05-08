@@ -146,6 +146,9 @@ and no attempt is made to conceal the injection.
 ## Development
 
 ```bash
+# Set up the pre-commit hook (fmt → clippy → test)
+make setup-hooks
+
 # Everything in one go: format, lint, and test
 make all
 
