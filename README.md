@@ -8,7 +8,7 @@ events. Because the events are delivered inside the target's own
 `wl_display_dispatch` call, the compositor never sees them — the application
 treats them as genuine input.
 
-[![CI](https://github.com/example/backseat/actions/workflows/ci.yml/badge.svg)](https://github.com/example/backseat/actions/workflows/ci.yml)
+[![CI](https://github.com/Jashooa/backseat/actions/workflows/ci.yml/badge.svg)](https://github.com/Jashooa/backseat/actions/workflows/ci.yml)
 
 ## Quick start
 
