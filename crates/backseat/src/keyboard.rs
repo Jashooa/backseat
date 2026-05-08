@@ -57,14 +57,16 @@ impl Keyboard {
     /// Type a string of ASCII characters.
     ///
     /// Each character is converted to a [`Key`] and sent as a tap.  Non-ASCII
-    /// characters are silently skipped (CJK / IME input requires
-    /// `zwp_text_input_v3`, deferred to a later version).
+    /// characters and unrecognised punctuation return
+    /// [`Error::SocketError`](crate::Error::SocketError).
     pub async fn type_text(&self, text: &str) -> Result<(), Error> {
         for ch in text.chars() {
             if !ch.is_ascii() {
-                continue;
+                return Err(Error::SocketError(format!(
+                    "unsupported non-ASCII character: {ch}"
+                )));
             }
-            let key = ascii_to_key(ch);
+            let key = ascii_to_key(ch)?;
             self.tap(key).await?;
         }
         Ok(())
@@ -89,59 +91,61 @@ impl Keyboard {
 
 /// Convert an ASCII character to the closest [`Key`] variant.
 ///
-/// Unrecognised characters map to [`Key::Raw(0)`](crate::Key::Raw).
-fn ascii_to_key(ch: char) -> Key {
+/// Returns `Err` for characters that have no defined mapping.
+fn ascii_to_key(ch: char) -> Result<Key, Error> {
     match ch {
-        'a' | 'A' => Key::A,
-        'b' | 'B' => Key::B,
-        'c' | 'C' => Key::C,
-        'd' | 'D' => Key::D,
-        'e' | 'E' => Key::E,
-        'f' | 'F' => Key::F,
-        'g' | 'G' => Key::G,
-        'h' | 'H' => Key::H,
-        'i' | 'I' => Key::I,
-        'j' | 'J' => Key::J,
-        'k' | 'K' => Key::K,
-        'l' | 'L' => Key::L,
-        'm' | 'M' => Key::M,
-        'n' | 'N' => Key::N,
-        'o' | 'O' => Key::O,
-        'p' | 'P' => Key::P,
-        'q' | 'Q' => Key::Q,
-        'r' | 'R' => Key::R,
-        's' | 'S' => Key::S,
-        't' | 'T' => Key::T,
-        'u' | 'U' => Key::U,
-        'v' | 'V' => Key::V,
-        'w' | 'W' => Key::W,
-        'x' | 'X' => Key::X,
-        'y' | 'Y' => Key::Y,
-        'z' | 'Z' => Key::Z,
-        '0' => Key::Num0,
-        '1' => Key::Num1,
-        '2' => Key::Num2,
-        '3' => Key::Num3,
-        '4' => Key::Num4,
-        '5' => Key::Num5,
-        '6' => Key::Num6,
-        '7' => Key::Num7,
-        '8' => Key::Num8,
-        '9' => Key::Num9,
-        ' ' => Key::Space,
-        '\n' => Key::Enter,
-        '\t' => Key::Tab,
-        '-' => Key::Minus,
-        '=' => Key::Equal,
-        '[' => Key::LeftBrace,
-        ']' => Key::RightBrace,
-        '\\' => Key::Backslash,
-        ';' => Key::Semicolon,
-        '\'' => Key::Apostrophe,
-        '`' => Key::Grave,
-        ',' => Key::Comma,
-        '.' => Key::Dot,
-        '/' => Key::Slash,
-        _ => Key::Raw(0),
+        'a' | 'A' => Ok(Key::A),
+        'b' | 'B' => Ok(Key::B),
+        'c' | 'C' => Ok(Key::C),
+        'd' | 'D' => Ok(Key::D),
+        'e' | 'E' => Ok(Key::E),
+        'f' | 'F' => Ok(Key::F),
+        'g' | 'G' => Ok(Key::G),
+        'h' | 'H' => Ok(Key::H),
+        'i' | 'I' => Ok(Key::I),
+        'j' | 'J' => Ok(Key::J),
+        'k' | 'K' => Ok(Key::K),
+        'l' | 'L' => Ok(Key::L),
+        'm' | 'M' => Ok(Key::M),
+        'n' | 'N' => Ok(Key::N),
+        'o' | 'O' => Ok(Key::O),
+        'p' | 'P' => Ok(Key::P),
+        'q' | 'Q' => Ok(Key::Q),
+        'r' | 'R' => Ok(Key::R),
+        's' | 'S' => Ok(Key::S),
+        't' | 'T' => Ok(Key::T),
+        'u' | 'U' => Ok(Key::U),
+        'v' | 'V' => Ok(Key::V),
+        'w' | 'W' => Ok(Key::W),
+        'x' | 'X' => Ok(Key::X),
+        'y' | 'Y' => Ok(Key::Y),
+        'z' | 'Z' => Ok(Key::Z),
+        '0' => Ok(Key::Num0),
+        '1' => Ok(Key::Num1),
+        '2' => Ok(Key::Num2),
+        '3' => Ok(Key::Num3),
+        '4' => Ok(Key::Num4),
+        '5' => Ok(Key::Num5),
+        '6' => Ok(Key::Num6),
+        '7' => Ok(Key::Num7),
+        '8' => Ok(Key::Num8),
+        '9' => Ok(Key::Num9),
+        ' ' => Ok(Key::Space),
+        '\n' => Ok(Key::Enter),
+        '\t' => Ok(Key::Tab),
+        '-' => Ok(Key::Minus),
+        '=' => Ok(Key::Equal),
+        '[' => Ok(Key::LeftBrace),
+        ']' => Ok(Key::RightBrace),
+        '\\' => Ok(Key::Backslash),
+        ';' => Ok(Key::Semicolon),
+        '\'' => Ok(Key::Apostrophe),
+        '`' => Ok(Key::Grave),
+        ',' => Ok(Key::Comma),
+        '.' => Ok(Key::Dot),
+        '/' => Ok(Key::Slash),
+        _ => Err(Error::SocketError(format!(
+            "unsupported ASCII character: {ch}"
+        ))),
     }
 }

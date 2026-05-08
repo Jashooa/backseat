@@ -531,11 +531,13 @@ fn make_ok_size(w: u32, h: u32) -> String {
 }
 
 /// Build a `{"status":"error","code":...,"message":...}` response.
-fn make_error(code: &str, message: &str) -> String {
+fn make_error(code: &str, message: &str, kind: Option<&str>) -> String {
+    let kind_json = kind.map_or(String::new(), |k| format!(",\"kind\":\"{}\"", k));
     format!(
-        "{{\"status\":\"error\",\"code\":\"{}\",\"message\":\"{}\"}}",
+        "{{\"status\":\"error\",\"code\":\"{}\",\"message\":\"{}\"{}}}",
         code,
-        message.replace('"', "\\\"")
+        message.replace('"', "\\\""),
+        kind_json
     ) + "\n"
 }
 
@@ -696,7 +698,7 @@ fn handle_request(line: &str) -> String {
 
     let req: IpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
-        Err(_) => return make_error("invalid_json", "could not parse request"),
+        Err(_) => return make_error("invalid_json", "could not parse request", None),
     };
 
     match req.ty.as_str() {
@@ -722,19 +724,27 @@ fn handle_request(line: &str) -> String {
         }
         "surface_size" => {
             if G_XDG_TOPLEVEL.load(Ordering::Acquire).is_null() {
-                return make_error("proxy_not_found", "xdg_toplevel not captured yet");
+                return make_error(
+                    "proxy_not_found",
+                    "xdg_toplevel not captured yet",
+                    Some("xdg_toplevel"),
+                );
             }
             let w = G_SURFACE_W.load(Ordering::Acquire);
             let h = G_SURFACE_H.load(Ordering::Acquire);
             if w == 0 || h == 0 {
-                return make_error("proxy_not_found", "surface size not yet configured");
+                return make_error(
+                    "proxy_not_found",
+                    "surface size not yet configured",
+                    Some("xdg_toplevel"),
+                );
             }
             make_ok_size(w, h)
         }
         "rescan" => {
             let display = G_DISPLAY.load(Ordering::Acquire);
             if display.is_null() {
-                return make_error("dispatch_hook_not_installed", "display not yet seen");
+                return make_error("dispatch_hook_not_installed", "display not yet seen", None);
             }
             // SAFETY: `display` was stored by the dispatch hook and is valid.
             unsafe { initial_sweep(display) };
@@ -742,7 +752,7 @@ fn handle_request(line: &str) -> String {
         }
         "unload" => make_ok(),
         "status" => make_status(G_DISPATCH_CALLED.load(Ordering::Acquire)),
-        _ => make_error("unknown_command", "unrecognized request type"),
+        _ => make_error("unknown_command", "unrecognized request type", None),
     }
 }
 

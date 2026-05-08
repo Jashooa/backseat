@@ -5,6 +5,9 @@
 //! connection to the injected payload and provides [`Mouse`](crate::Mouse) and
 //! [`Keyboard`](crate::Keyboard) handles that share the same connection.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,6 +101,10 @@ pub(crate) struct Response {
     pub(crate) code: Option<String>,
     #[serde(default)]
     pub(crate) message: Option<String>,
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+    #[serde(default)]
+    pub(crate) dispatch_hook_installed: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +153,7 @@ impl Session {
         // Give the payload's IPC thread a moment to bind its socket.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let sock_path = format!("/tmp/backseat-{}.sock", pid);
+        let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
         let stream = timeout(TIMEOUT, UnixStream::connect(&sock_path))
             .await
             .map_err(|_| Error::SocketTimeout {
@@ -173,6 +180,26 @@ impl Session {
                     expected: PROTOCOL_VERSION,
                     got: ack.protocol_version,
                 });
+            }
+        }
+
+        // Assert the dispatch hook has actually fired.  If the target was
+        // linked BIND_NOW / -Bsymbolic, PLT shadowing may not take effect.
+        {
+            let mut s = stream.lock().await;
+            send_line(&mut s, &Command::new("status")).await?;
+            let line = read_line(&mut s).await?;
+            let status: Response = serde_json::from_str(&line)
+                .map_err(|e| Error::SocketError(format!("invalid status: {e}")))?;
+            if status.status != "ok" {
+                return Err(map_ipc_error(
+                    &status.code.unwrap_or_default(),
+                    &status.message.unwrap_or_default(),
+                    status.kind.as_deref(),
+                ));
+            }
+            if status.dispatch_hook_installed == Some(false) {
+                return Err(Error::DispatchHookNotInstalled);
             }
         }
 
@@ -208,7 +235,7 @@ impl Session {
         let _ = s.shutdown().await;
         drop(s);
 
-        let sock_path = format!("/tmp/backseat-{}.sock", self.pid);
+        let sock_path = runtime_dir().join(format!("backseat-{}.sock", self.pid));
         let _ = tokio::fs::remove_file(&sock_path).await;
 
         if let Ok(path) = extract_payload().await {
@@ -231,7 +258,8 @@ impl Drop for Session {
                     let mut s = stream.lock().await;
                     let _ = send_line(&mut s, &Command::new("unload")).await;
                     let _ = s.shutdown().await;
-                    let _ = tokio::fs::remove_file(format!("/tmp/backseat-{}.sock", pid)).await;
+                    let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
+                    let _ = tokio::fs::remove_file(&sock_path).await;
                 });
             }
         });
@@ -250,17 +278,32 @@ pub(crate) async fn send_command(stream: &mut UnixStream, cmd: Command) -> Resul
         .map_err(|e| Error::SocketError(format!("invalid response: {e}")))?;
     if resp.status == "error" {
         let code = resp.code.clone().unwrap_or_default();
-        return Err(map_ipc_error(&code, &resp.message.unwrap_or_default()));
+        return Err(map_ipc_error(
+            &code,
+            &resp.message.unwrap_or_default(),
+            resp.kind.as_deref(),
+        ));
     }
     Ok(resp)
 }
 
 /// Map payload error codes back to structured `Error` variants.
-fn map_ipc_error(code: &str, message: &str) -> Error {
+fn map_ipc_error(code: &str, message: &str, kind: Option<&str>) -> Error {
     match code {
-        "proxy_not_found" => Error::ProxyNotFound {
-            kind: crate::error::ProxyKind::Pointer,
-        },
+        "proxy_not_found" => {
+            let proxy_kind = kind.and_then(|k| match k {
+                "pointer" => Some(crate::error::ProxyKind::Pointer),
+                "keyboard" => Some(crate::error::ProxyKind::Keyboard),
+                "seat" => Some(crate::error::ProxyKind::Seat),
+                "xdg_surface" => Some(crate::error::ProxyKind::XdgSurface),
+                "xdg_toplevel" => Some(crate::error::ProxyKind::XdgToplevel),
+                _ => None,
+            });
+            match proxy_kind {
+                Some(k) => Error::ProxyNotFound { kind: k },
+                None => Error::SocketError(format!("proxy_not_found: {message}")),
+            }
+        }
         "dispatch_hook_not_installed" => Error::DispatchHookNotInstalled,
         _ => Error::SocketError(message.to_string()),
     }
@@ -295,10 +338,22 @@ async fn read_line(s: &mut UnixStream) -> Result<String, Error> {
     Ok(line.trim().to_string())
 }
 
-/// Extract the embedded payload `.so` to `/tmp` if it is not already present.
+/// Return a suitable runtime directory for temporary files.
+///
+/// Prefers `$XDG_RUNTIME_DIR` (user-owned, typically `/run/user/<uid>`),
+/// falling back to `/tmp`.
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// Extract the embedded payload `.so` to the runtime directory.
 ///
 /// The filename includes an 8-byte SHA-256 prefix so that different crate
-/// versions never reuse stale payloads.
+/// versions never reuse stale payloads.  The file is created with
+/// `O_CREAT | O_EXCL | O_NOFOLLOW` and mode `0600` so a pre-existing
+/// attacker-controlled file cannot be raced.
 async fn extract_payload() -> Result<PathBuf, Error> {
     tokio::task::spawn_blocking(|| {
         // The build script sets BACKSEAT_PAYLOAD_PATH to the compiled
@@ -306,11 +361,25 @@ async fn extract_payload() -> Result<PathBuf, Error> {
         let bytes = include_bytes!(env!("BACKSEAT_PAYLOAD_PATH"));
         let hash = sha2::Sha256::digest(bytes);
         let prefix = hex::encode(&hash[..8]);
-        let path = PathBuf::from(format!("/tmp/backseat-payload-{}.so", prefix));
-        if !path.exists() {
-            std::fs::write(&path, bytes.as_slice())
-                .map_err(|e| Error::PayloadExtractFailed(e.to_string()))?;
+        let dir = runtime_dir();
+        let path = dir.join(format!("backseat-payload-{}.so", prefix));
+
+        // Fast path: file already exists and was written by us in a
+        // previous run.
+        if path.exists() {
+            return Ok(path);
         }
+
+        // Atomic create with exclusive lock to prevent symlink / race attacks.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| Error::PayloadExtractFailed(format!("open payload: {e}")))?;
+        file.write_all(bytes.as_slice())
+            .map_err(|e| Error::PayloadExtractFailed(format!("write payload: {e}")))?;
+        drop(file);
         Ok(path)
     })
     .await
