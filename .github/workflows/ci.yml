@@ -19,12 +19,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The payload must be built before the host crate because
+      # backseat/build.rs embeds libbackseat_payload.so via include_bytes!.
+      - name: Build payload
+        run: cargo build -p backseat-payload
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Build payload
-        run: cargo build -p backseat-payload
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -39,5 +41,7 @@ jobs:
         run: cargo test -p backseat --lib
       - name: Run doc tests
         run: cargo test -p backseat --doc
-      - name: Run integration tests (ignored if no Wayland)
-        run: cargo test -p backseat --test integration -- --ignored || true
+      - name: Run integration tests
+        # Integration tests are gated on WAYLAND_DISPLAY + ptrace permissions
+        # and gracefully skip themselves on CI runners where neither is present.
+        run: cargo test -p backseat --test integration -- --ignored
