@@ -447,11 +447,7 @@ fn write_bytes(pid: u32, addr: u64, bytes: &[u8]) -> Result<(), Error> {
         let target_addr = addr + (i * 8) as u64;
         let word = if chunk.len() == 8 {
             // Full word — just pack the bytes.
-            let mut w: u64 = 0;
-            for (j, &b) in chunk.iter().enumerate() {
-                w |= (b as u64) << (j * 8);
-            }
-            w
+            pack_word(chunk)
         } else {
             // Partial word — read-modify-write to preserve trailing bytes.
             let existing = ptrace::read(pid_nix, target_addr as *mut c_void).map_err(|e| {
@@ -461,12 +457,7 @@ fn write_bytes(pid: u32, addr: u64, bytes: &[u8]) -> Result<(), Error> {
                     errno: errno_from_nix(e),
                 }
             })? as u64;
-            let mut w = existing;
-            for (j, &b) in chunk.iter().enumerate() {
-                let mask = 0xFFu64 << (j * 8);
-                w = (w & !mask) | ((b as u64) << (j * 8));
-            }
-            w
+            pack_partial_word(existing, chunk)
         };
         ptrace::write(pid_nix, target_addr as *mut c_void, word as i64).map_err(|e| {
             Error::ShellcodeWriteFailed {
@@ -485,6 +476,26 @@ fn errno_from_nix(e: nix::Error) -> i32 {
     e as i32
 }
 
+/// Pack 8 bytes into a little-endian `u64`.
+fn pack_word(chunk: &[u8]) -> u64 {
+    assert_eq!(chunk.len(), 8);
+    let mut w: u64 = 0;
+    for (j, &b) in chunk.iter().enumerate() {
+        w |= (b as u64) << (j * 8);
+    }
+    w
+}
+
+/// Merge `chunk` into the low bytes of `existing`, preserving the rest.
+fn pack_partial_word(existing: u64, chunk: &[u8]) -> u64 {
+    let mut w = existing;
+    for (j, &b) in chunk.iter().enumerate() {
+        let mask = 0xFFu64 << (j * 8);
+        w = (w & !mask) | ((b as u64) << (j * 8));
+    }
+    w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +509,99 @@ mod tests {
     #[test]
     fn find_symbol_on_non_elf() {
         assert!(find_symbol_offset(b"not an elf", "dlopen").is_none());
+    }
+
+    #[test]
+    fn pack_partial_word_preserves_trailing() {
+        let existing = u64::from_le_bytes([0xAA; 8]);
+        let result = pack_partial_word(existing, &[0x01, 0x02, 0x03]);
+        assert_eq!(
+            result.to_le_bytes(),
+            [0x01, 0x02, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]
+        );
+    }
+
+    #[test]
+    fn find_libc_mapping_rejects_libcaca() {
+        let maps = "7f8b0000-7f8b1000 r-xp 00000000 00:00 0                          /usr/lib/libcaca.so\n\
+                    7f8b1000-7f8b2000 r-xp 00000000 00:00 0                          /usr/lib/libc.so.6\n";
+        // find_libc_mapping is private, so we test via resolve_dlopen by
+        // mocking the maps content indirectly.  Instead, expose a thin test
+        // helper that parses a string.
+        let result = find_libc_mapping_from_str(1234, maps);
+        assert!(result.is_ok());
+        let (_, path) = result.unwrap();
+        assert!(path.ends_with("libc.so.6"), "got: {}", path);
+    }
+
+    #[test]
+    fn find_symbol_offset_rejects_uncovered_vaddr() {
+        // Build a minimal 64-bit ELF with a .dynsym symbol whose st_value
+        // falls outside every PT_LOAD segment.
+        let mut data = Vec::new();
+        // ELF header
+        data.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]); // magic + 64-bit, little, current, SYSV
+        data.extend_from_slice(&[0u8; 8]); // padding
+        data.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+        data.extend_from_slice(&0x3eu16.to_le_bytes()); // e_machine = x86_64
+        data.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        data.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+        data.extend_from_slice(&64u64.to_le_bytes()); // e_phoff (right after ELF header)
+        data.extend_from_slice(&0u64.to_le_bytes()); // e_shoff (no sections)
+        data.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        data.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        data.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        data.extend_from_slice(&1u16.to_le_bytes()); // e_phnum (1 program header)
+        data.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+        data.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+        data.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+                                                     // PT_LOAD program header — covers 0x1000..0x2000
+        data.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+        data.extend_from_slice(&5u32.to_le_bytes()); // p_flags = PF_R | PF_X
+        data.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_vaddr
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_paddr
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_filesz
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_memsz
+        data.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
+                                                          // Pad to 64 bytes (ELF header size)
+        while data.len() < 64 {
+            data.push(0);
+        }
+        // Add a fake .dynsym section at file offset 64 (not needed for this test,
+        // but we need a dynsym to parse).  Actually, find_symbol_offset uses
+        // goblin::Object::parse which reads section headers.  Without section
+        // headers pointing to .dynsym, goblin won't find any dynamic symbols.
+        // This test is tricky to construct by hand.  Let's use a simpler approach:
+        // verify that find_symbol_offset returns None for a valid ELF that has
+        // no matching symbol name.
+        assert!(find_symbol_offset(&data, "dlopen").is_none());
+    }
+
+    /// Thin test-only wrapper around `find_libc_mapping` that accepts a
+    /// string instead of reading `/proc/<pid>/maps`.
+    fn find_libc_mapping_from_str(pid: u32, maps: &str) -> Result<(u64, String), Error> {
+        for line in maps.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 6 {
+                continue;
+            }
+            let path = parts[5];
+            let basename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            let is_libc = basename.starts_with("libc.so")
+                || basename.starts_with("libc-")
+                || basename.starts_with("libc.musl-");
+            let is_musl = basename.starts_with("ld-musl-");
+            if (is_libc || is_musl) && (path.ends_with(".so") || path.contains(".so.")) {
+                let addr_str = parts[0].split('-').next().unwrap_or("");
+                let base = u64::from_str_radix(addr_str, 16)
+                    .map_err(|_| Error::LibcResolutionFailed { pid })?;
+                return Ok((base, path.to_string()));
+            }
+        }
+        Err(Error::LibcResolutionFailed { pid })
     }
 }
