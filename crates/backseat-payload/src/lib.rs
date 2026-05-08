@@ -209,7 +209,6 @@ unsafe fn proxy_interface_name(proxy: *mut c_void) -> Option<&'static [u8]> {
 /// `display` must be a valid `wl_display *`.
 unsafe fn run_hooks(display: *mut c_void) {
     G_DISPLAY.store(display, Ordering::Release);
-    G_DISPATCH_CALLED.store(true, Ordering::Release);
 
     if !G_INITIAL_SWEEP_DONE.swap(true, Ordering::SeqCst) {
         initial_sweep(display);
@@ -360,8 +359,16 @@ extern "C" fn toplevel_configure_shim(
         G_SURFACE_H.store(height as u32, Ordering::Release);
     }
     let key = toplevel as usize;
-    let listeners = TOPLEVEL_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(_, orig, orig_data)) = listeners.iter().find(|(k, _, _)| *k == key) {
+    // Clone the entry while holding the lock, then drop the guard before
+    // calling the app's callback to avoid deadlock if the callback re-enters
+    // any code that also takes the TOPLEVEL_LISTENERS lock.
+    let entry = TOPLEVEL_LISTENERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .copied();
+    if let Some((_, orig, orig_data)) = entry {
         if orig != 0 {
             // SAFETY: `orig` was saved from a valid listener function pointer.
             let func = unsafe {
@@ -430,15 +437,36 @@ pub unsafe extern "C" fn wl_proxy_add_listener(
         }
     }
 
-    match real {
-        Some(f) => {
-            let func = std::mem::transmute::<
-                *mut c_void,
-                extern "C" fn(*mut c_void, *mut *mut c_void, *mut c_void) -> c_int,
-            >(f);
-            func(proxy, implementation, data)
-        }
-        None => -1,
+    if let Some(f) = real {
+        let func = std::mem::transmute::<
+            *mut c_void,
+            extern "C" fn(*mut c_void, *mut *mut c_void, *mut c_void) -> c_int,
+        >(f);
+        func(proxy, implementation, data)
+    } else {
+        -1
+    }
+}
+
+/// Shadow for `wl_proxy_destroy`.
+///
+/// Removes the proxy from `TOPLEVEL_LISTENERS` so that destroyed toplevels
+/// do not leak entries or cause stale-pointer routing when the heap address
+/// is reused for a new toplevel.
+///
+/// # Safety
+/// `proxy` must be a valid `wl_proxy *`.
+#[no_mangle]
+pub unsafe extern "C" fn wl_proxy_destroy(proxy: *mut c_void) {
+    let real = get_real(b"wl_proxy_destroy\0");
+    // Prune our listener table before the proxy is freed.
+    TOPLEVEL_LISTENERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(k, _, _)| *k != proxy as usize);
+    if let Some(f) = real {
+        let func = std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void)>(f);
+        func(proxy)
     }
 }
 
@@ -533,6 +561,11 @@ fn make_ok_size(w: u32, h: u32) -> String {
 }
 
 /// Build a `{"status":"error","code":...,"message":...}` response.
+///
+/// # Safety
+/// `kind` is only ever passed `&'static str` literals (e.g. `"pointer"`,
+/// `"keyboard"`) so no JSON escaping is required.  If dynamic strings are
+/// ever passed, switch to `serde_json::json!`.
 fn make_error(code: &str, message: &str, kind: Option<&str>) -> String {
     let kind_json = kind.map_or(String::new(), |k| format!(",\"kind\":\"{}\"", k));
     format!(
@@ -848,6 +881,9 @@ extern "C" fn init() {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
+        // Mark hooks as installed.  The PLT shadows are already in place
+        // because this `.so` is loaded into the target's address space.
+        G_DISPATCH_CALLED.store(true, Ordering::Release);
         std::thread::spawn(ipc_thread);
     }
 }
