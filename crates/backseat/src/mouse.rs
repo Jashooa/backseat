@@ -15,7 +15,7 @@ use crate::keys::{Axis, Button};
 use crate::session::{send_command, Command, Response};
 
 /// Mouse input handle.  Clones share the same IPC connection.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Mouse {
     stream: Arc<Mutex<UnixStream>>,
 }

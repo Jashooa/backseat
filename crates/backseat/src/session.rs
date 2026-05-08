@@ -122,6 +122,7 @@ pub(crate) struct Response {
 /// Always prefer calling [`Session::unload`].await explicitly.  The [`Drop`]
 /// implementation spawns a best-effort blocking task to clean up, but if the
 /// Tokio runtime is already shutting down the payload may leak.
+#[derive(Debug)]
 pub struct Session {
     /// Mouse input API.
     pub mouse: Mouse,

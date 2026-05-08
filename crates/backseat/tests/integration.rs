@@ -43,11 +43,10 @@ async fn test_self_injection_fails_gracefully() {
 
     let own_pid = std::process::id();
     let result = Session::new(own_pid).await;
-    // We expect this to fail because ptrace attach on self is not allowed
-    // while the process is not stopped.
+    // ptrace attach on self returns EPERM on Linux.
     assert!(
-        matches!(result, Err(Error::PtraceFailed { .. }))
-            || matches!(result, Err(Error::PermissionDenied(..)))
+        matches!(result, Err(Error::PermissionDenied(pid)) if pid == own_pid),
+        "expected PermissionDenied for self-ptrace, got {result:?}"
     );
 }
 

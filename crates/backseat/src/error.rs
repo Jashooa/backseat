@@ -74,6 +74,10 @@ pub enum Error {
     /// The payload failed to unload cleanly.
     #[error("unload failed: {0}")]
     UnloadFailed(String),
+
+    /// `waitpid` returned an unexpected status during ptrace flow.
+    #[error("unexpected wait status during {op:?} for PID {pid}")]
+    UnexpectedWaitStatus { pid: u32, op: PtraceOp },
 }
 
 /// Ptrace operations that can fail.

@@ -21,8 +21,4 @@ goblin = "0.10"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
-criterion = { version = "0.8", features = ["async_tokio"] }
 
-[[bench]]
-name = "throughput"
-harness = false

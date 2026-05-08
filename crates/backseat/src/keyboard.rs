@@ -14,7 +14,7 @@ use crate::keys::Key;
 use crate::session::{send_command, Command, Response};
 
 /// Keyboard input handle.  Clones share the same IPC connection.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Keyboard {
     stream: Arc<Mutex<UnixStream>>,
 }

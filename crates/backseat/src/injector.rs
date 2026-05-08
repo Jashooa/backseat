@@ -10,6 +10,9 @@
 //! 4. ** ptrace flow** — attach, save registers, execute stub, read result,
 //!    restore state, detach.
 
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("backseat only supports x86_64 Linux");
+
 use std::ffi::c_void;
 use std::path::Path;
 
@@ -95,10 +98,9 @@ pub fn inject_payload(pid: u32, payload_path: &Path) -> Result<(), Error> {
         errno: errno_from_nix(e),
     })?;
     if !matches!(status, WaitStatus::Stopped(_, Signal::SIGSTOP)) {
-        return Err(Error::PtraceFailed {
+        return Err(Error::UnexpectedWaitStatus {
             pid,
             op: PtraceOp::Attach,
-            errno: -1,
         });
     }
 
@@ -159,10 +161,9 @@ pub fn inject_payload(pid: u32, payload_path: &Path) -> Result<(), Error> {
             errno: errno_from_nix(e),
         })?;
         if !matches!(status, WaitStatus::Stopped(_, Signal::SIGTRAP)) {
-            return Err(Error::PtraceFailed {
+            return Err(Error::UnexpectedWaitStatus {
                 pid,
                 op: PtraceOp::Cont,
-                errno: -1,
             });
         }
 

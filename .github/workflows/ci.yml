@@ -31,11 +31,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run unit tests
-        run: cargo test -p backseat --lib
-      - name: Run doc tests
-        run: cargo test -p backseat --doc
-      - name: Run integration tests
-        # Integration tests are gated on WAYLAND_DISPLAY + ptrace permissions
-        # and gracefully skip themselves on CI runners where neither is present.
-        run: cargo test -p backseat --test integration -- --ignored
+      - name: Run workspace tests
+        run: cargo test --workspace
