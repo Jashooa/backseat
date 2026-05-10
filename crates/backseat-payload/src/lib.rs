@@ -626,10 +626,14 @@ fn make_hello_ack() -> String {
 
 /// Build the status response used to report whether PLT interposition is
 /// active.
+///
+/// Reports `G_DISPATCH_CALLED` — the only definitive signal that the
+/// dispatch hook has actually fired (as opposed to `G_INTERPOSITION_OK`,
+/// which may be true for BIND_NOW targets even when the hook never runs).
 fn make_status() -> String {
     format!(
         r#"{{"status":"ok","dispatch_hook_installed":{}}}"#,
-        G_INTERPOSITION_OK.load(Ordering::Acquire)
+        G_DISPATCH_CALLED.load(Ordering::Acquire)
     ) + "\n"
 }
 
