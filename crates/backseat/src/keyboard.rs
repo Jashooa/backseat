@@ -54,11 +54,25 @@ impl Keyboard {
         Ok(())
     }
 
+    /// Send a `modifiers` event with the given depressed modifier bitmask.
+    ///
+    /// Wayland uses `WL_KEYBOARD_MODIFIER_SHIFT = 0x1` for Shift.
+    pub async fn modifiers(&self, depressed: u32) -> Result<(), Error> {
+        self.send(Command {
+            ty: "modifiers".to_string(),
+            depressed: Some(depressed),
+            ..Command::new("modifiers")
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Type a string of ASCII characters.
     ///
-    /// Each character is converted to a [`Key`] and sent as a tap.  Non-ASCII
-    /// characters and unrecognised punctuation return
-    /// [`Error::SocketError`](crate::Error::SocketError).
+    /// Each character is converted to a [`Key`] and sent as a tap.  Capital
+    /// letters and shifted punctuation automatically synthesise Shift
+    /// down/up around the key event.  Non-ASCII characters and unrecognised
+    /// punctuation return [`Error::SocketError`](crate::Error::SocketError).
     pub async fn type_text(&self, text: &str) -> Result<(), Error> {
         for ch in text.chars() {
             if !ch.is_ascii() {
@@ -66,8 +80,15 @@ impl Keyboard {
                     "unsupported non-ASCII character: {ch}"
                 )));
             }
-            let key = ascii_to_key(ch)?;
-            self.tap(key).await?;
+            let (key, needs_shift) = ascii_to_key(ch)?;
+            if needs_shift {
+                self.modifiers(0x1).await?;
+                self.down(key).await?;
+                self.up(key).await?;
+                self.modifiers(0x0).await?;
+            } else {
+                self.tap(key).await?;
+            }
         }
         Ok(())
     }
@@ -89,61 +110,109 @@ impl Keyboard {
     }
 }
 
-/// Convert an ASCII character to the closest [`Key`] variant.
+/// Convert an ASCII character to the closest [`Key`] variant and whether
+/// Shift is required.
 ///
 /// Returns `Err` for characters that have no defined mapping.
-fn ascii_to_key(ch: char) -> Result<Key, Error> {
+fn ascii_to_key(ch: char) -> Result<(Key, bool), Error> {
     match ch {
-        'a' | 'A' => Ok(Key::A),
-        'b' | 'B' => Ok(Key::B),
-        'c' | 'C' => Ok(Key::C),
-        'd' | 'D' => Ok(Key::D),
-        'e' | 'E' => Ok(Key::E),
-        'f' | 'F' => Ok(Key::F),
-        'g' | 'G' => Ok(Key::G),
-        'h' | 'H' => Ok(Key::H),
-        'i' | 'I' => Ok(Key::I),
-        'j' | 'J' => Ok(Key::J),
-        'k' | 'K' => Ok(Key::K),
-        'l' | 'L' => Ok(Key::L),
-        'm' | 'M' => Ok(Key::M),
-        'n' | 'N' => Ok(Key::N),
-        'o' | 'O' => Ok(Key::O),
-        'p' | 'P' => Ok(Key::P),
-        'q' | 'Q' => Ok(Key::Q),
-        'r' | 'R' => Ok(Key::R),
-        's' | 'S' => Ok(Key::S),
-        't' | 'T' => Ok(Key::T),
-        'u' | 'U' => Ok(Key::U),
-        'v' | 'V' => Ok(Key::V),
-        'w' | 'W' => Ok(Key::W),
-        'x' | 'X' => Ok(Key::X),
-        'y' | 'Y' => Ok(Key::Y),
-        'z' | 'Z' => Ok(Key::Z),
-        '0' => Ok(Key::Num0),
-        '1' => Ok(Key::Num1),
-        '2' => Ok(Key::Num2),
-        '3' => Ok(Key::Num3),
-        '4' => Ok(Key::Num4),
-        '5' => Ok(Key::Num5),
-        '6' => Ok(Key::Num6),
-        '7' => Ok(Key::Num7),
-        '8' => Ok(Key::Num8),
-        '9' => Ok(Key::Num9),
-        ' ' => Ok(Key::Space),
-        '\n' => Ok(Key::Enter),
-        '\t' => Ok(Key::Tab),
-        '-' => Ok(Key::Minus),
-        '=' => Ok(Key::Equal),
-        '[' => Ok(Key::LeftBrace),
-        ']' => Ok(Key::RightBrace),
-        '\\' => Ok(Key::Backslash),
-        ';' => Ok(Key::Semicolon),
-        '\'' => Ok(Key::Apostrophe),
-        '`' => Ok(Key::Grave),
-        ',' => Ok(Key::Comma),
-        '.' => Ok(Key::Dot),
-        '/' => Ok(Key::Slash),
+        'a' => Ok((Key::A, false)),
+        'A' => Ok((Key::A, true)),
+        'b' => Ok((Key::B, false)),
+        'B' => Ok((Key::B, true)),
+        'c' => Ok((Key::C, false)),
+        'C' => Ok((Key::C, true)),
+        'd' => Ok((Key::D, false)),
+        'D' => Ok((Key::D, true)),
+        'e' => Ok((Key::E, false)),
+        'E' => Ok((Key::E, true)),
+        'f' => Ok((Key::F, false)),
+        'F' => Ok((Key::F, true)),
+        'g' => Ok((Key::G, false)),
+        'G' => Ok((Key::G, true)),
+        'h' => Ok((Key::H, false)),
+        'H' => Ok((Key::H, true)),
+        'i' => Ok((Key::I, false)),
+        'I' => Ok((Key::I, true)),
+        'j' => Ok((Key::J, false)),
+        'J' => Ok((Key::J, true)),
+        'k' => Ok((Key::K, false)),
+        'K' => Ok((Key::K, true)),
+        'l' => Ok((Key::L, false)),
+        'L' => Ok((Key::L, true)),
+        'm' => Ok((Key::M, false)),
+        'M' => Ok((Key::M, true)),
+        'n' => Ok((Key::N, false)),
+        'N' => Ok((Key::N, true)),
+        'o' => Ok((Key::O, false)),
+        'O' => Ok((Key::O, true)),
+        'p' => Ok((Key::P, false)),
+        'P' => Ok((Key::P, true)),
+        'q' => Ok((Key::Q, false)),
+        'Q' => Ok((Key::Q, true)),
+        'r' => Ok((Key::R, false)),
+        'R' => Ok((Key::R, true)),
+        's' => Ok((Key::S, false)),
+        'S' => Ok((Key::S, true)),
+        't' => Ok((Key::T, false)),
+        'T' => Ok((Key::T, true)),
+        'u' => Ok((Key::U, false)),
+        'U' => Ok((Key::U, true)),
+        'v' => Ok((Key::V, false)),
+        'V' => Ok((Key::V, true)),
+        'w' => Ok((Key::W, false)),
+        'W' => Ok((Key::W, true)),
+        'x' => Ok((Key::X, false)),
+        'X' => Ok((Key::X, true)),
+        'y' => Ok((Key::Y, false)),
+        'Y' => Ok((Key::Y, true)),
+        'z' => Ok((Key::Z, false)),
+        'Z' => Ok((Key::Z, true)),
+        '0' => Ok((Key::Num0, false)),
+        '1' => Ok((Key::Num1, false)),
+        '2' => Ok((Key::Num2, false)),
+        '3' => Ok((Key::Num3, false)),
+        '4' => Ok((Key::Num4, false)),
+        '5' => Ok((Key::Num5, false)),
+        '6' => Ok((Key::Num6, false)),
+        '7' => Ok((Key::Num7, false)),
+        '8' => Ok((Key::Num8, false)),
+        '9' => Ok((Key::Num9, false)),
+        ' ' => Ok((Key::Space, false)),
+        '\n' => Ok((Key::Enter, false)),
+        '\t' => Ok((Key::Tab, false)),
+        '-' => Ok((Key::Minus, false)),
+        '_' => Ok((Key::Minus, true)),
+        '=' => Ok((Key::Equal, false)),
+        '+' => Ok((Key::Equal, true)),
+        '[' => Ok((Key::LeftBrace, false)),
+        '{' => Ok((Key::LeftBrace, true)),
+        ']' => Ok((Key::RightBrace, false)),
+        '}' => Ok((Key::RightBrace, true)),
+        '\\' => Ok((Key::Backslash, false)),
+        '|' => Ok((Key::Backslash, true)),
+        ';' => Ok((Key::Semicolon, false)),
+        ':' => Ok((Key::Semicolon, true)),
+        '\'' => Ok((Key::Apostrophe, false)),
+        '"' => Ok((Key::Apostrophe, true)),
+        '`' => Ok((Key::Grave, false)),
+        '~' => Ok((Key::Grave, true)),
+        ',' => Ok((Key::Comma, false)),
+        '<' => Ok((Key::Comma, true)),
+        '.' => Ok((Key::Dot, false)),
+        '>' => Ok((Key::Dot, true)),
+        '/' => Ok((Key::Slash, false)),
+        '?' => Ok((Key::Slash, true)),
+        '!' => Ok((Key::Num1, true)),
+        '@' => Ok((Key::Num2, true)),
+        '#' => Ok((Key::Num3, true)),
+        '$' => Ok((Key::Num4, true)),
+        '%' => Ok((Key::Num5, true)),
+        '^' => Ok((Key::Num6, true)),
+        '&' => Ok((Key::Num7, true)),
+        '*' => Ok((Key::Num8, true)),
+        '(' => Ok((Key::Num9, true)),
+        ')' => Ok((Key::Num0, true)),
         _ => Err(Error::SocketError(format!(
             "unsupported ASCII character: {ch}"
         ))),
@@ -156,16 +225,16 @@ mod tests {
 
     #[test]
     fn ascii_to_key_recognised() {
-        assert_eq!(ascii_to_key('a').unwrap(), Key::A);
-        assert_eq!(ascii_to_key('A').unwrap(), Key::A);
-        assert_eq!(ascii_to_key('1').unwrap(), Key::Num1);
-        assert_eq!(ascii_to_key(' ').unwrap(), Key::Space);
+        assert_eq!(ascii_to_key('a').unwrap(), (Key::A, false));
+        assert_eq!(ascii_to_key('A').unwrap(), (Key::A, true));
+        assert_eq!(ascii_to_key('1').unwrap(), (Key::Num1, false));
+        assert_eq!(ascii_to_key(' ').unwrap(), (Key::Space, false));
     }
 
     #[test]
     fn ascii_to_key_unrecognised() {
         assert!(
-            matches!(ascii_to_key('!'), Err(Error::SocketError(msg)) if msg.contains("unsupported"))
+            matches!(ascii_to_key('€'), Err(Error::SocketError(msg)) if msg.contains("unsupported"))
         );
     }
 }

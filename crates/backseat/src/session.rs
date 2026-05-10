@@ -72,6 +72,8 @@ pub(crate) struct Command {
     pub(crate) axis: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) depressed: Option<u32>,
 }
 
 impl Command {
@@ -85,6 +87,7 @@ impl Command {
             key: None,
             axis: None,
             value: None,
+            depressed: None,
         }
     }
 }

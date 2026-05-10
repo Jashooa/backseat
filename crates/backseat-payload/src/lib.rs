@@ -582,6 +582,8 @@ struct IpcRequest {
     axis: Option<u32>,
     #[serde(default)]
     value: Option<f64>,
+    #[serde(default)]
+    depressed: Option<u32>,
 }
 
 /// Parsed command ready to be queued for dispatch on the app's event thread.
@@ -591,6 +593,7 @@ enum IpcCommand {
     MouseButton { button: u32, pressed: bool },
     Key { key: u32, pressed: bool },
     Scroll { axis: u32, value: f64 },
+    Modifiers { depressed: u32 },
 }
 
 /// Build a generic `{"status":"ok"}` response.
@@ -688,10 +691,24 @@ fn monotonic_ms() -> u32 {
 /// `wl_display_dispatch`).
 unsafe fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
     match cmd {
-        IpcCommand::MouseMove { x, y } => dispatch_mouse_move(x, y),
-        IpcCommand::MouseButton { button, pressed } => dispatch_mouse_button(button, pressed),
-        IpcCommand::Key { key, pressed } => dispatch_key(key, pressed),
-        IpcCommand::Scroll { axis, value } => dispatch_scroll(axis, value),
+        IpcCommand::MouseMove { x, y } => {
+            dispatch_mouse_move(x, y);
+            dispatch_pointer_frame();
+        }
+        IpcCommand::MouseButton { button, pressed } => {
+            dispatch_mouse_button(button, pressed);
+            dispatch_pointer_frame();
+        }
+        IpcCommand::Key { key, pressed } => {
+            dispatch_key(key, pressed);
+        }
+        IpcCommand::Scroll { axis, value } => {
+            dispatch_scroll(axis, value);
+            dispatch_pointer_frame();
+        }
+        IpcCommand::Modifiers { depressed } => {
+            dispatch_modifiers(depressed);
+        }
     }
 }
 
@@ -789,6 +806,45 @@ unsafe fn dispatch_scroll(axis: u32, value: f64) {
     func(data, proxy, time, axis, to_fixed(value));
 }
 
+/// Dispatch a synthetic `wl_pointer_listener.frame` event.
+///
+/// Wayland 1.10+ requires this to complete a pointer event batch.
+/// Without it, toolkits (GTK4, Qt6, SDL3, winit) buffer and discard
+/// partial pointer events.
+///
+/// # Safety
+/// Must run on the app's Wayland event thread.
+unsafe fn dispatch_pointer_frame() {
+    let proxy = G_POINTER.load(Ordering::Acquire);
+    let Some(func_ptr) = get_listener_func(proxy, 5) else {
+        return;
+    };
+    let func =
+        std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void, *mut c_void)>(func_ptr);
+    let data = (*proxy.cast::<wl_proxy>()).user_data;
+    func(data, proxy);
+}
+
+/// Dispatch a synthetic `wl_keyboard_listener.modifiers` event.
+///
+/// Modern toolkits expect this before/after key events that change
+/// modifier state (e.g. Shift for capital letters).
+///
+/// # Safety
+/// Must run on the app's Wayland event thread.
+unsafe fn dispatch_modifiers(depressed: u32) {
+    let proxy = G_KEYBOARD.load(Ordering::Acquire);
+    let Some(func_ptr) = get_listener_func(proxy, 1) else {
+        return;
+    };
+    let func = std::mem::transmute::<
+        *mut c_void,
+        extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32, u32),
+    >(func_ptr);
+    let data = (*proxy.cast::<wl_proxy>()).user_data;
+    func(data, proxy, next_serial(), depressed, 0, 0, 0);
+}
+
 // ---------------------------------------------------------------------------
 // IPC command handling
 // ---------------------------------------------------------------------------
@@ -835,6 +891,10 @@ fn handle_request(line: &str) -> HandleResult {
             let axis = req.axis.unwrap_or(0);
             let value = req.value.unwrap_or(0.0);
             HandleResult::Response(queue_cmd(IpcCommand::Scroll { axis, value }))
+        }
+        "modifiers" => {
+            let depressed = req.depressed.unwrap_or(0);
+            HandleResult::Response(queue_cmd(IpcCommand::Modifiers { depressed }))
         }
         "surface_size" => {
             if G_XDG_TOPLEVEL.load(Ordering::Acquire).is_null() {
