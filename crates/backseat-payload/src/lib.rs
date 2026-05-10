@@ -604,19 +604,24 @@ fn make_ok_size(w: u32, h: u32) -> String {
 }
 
 /// Build a `{"status":"error","code":...,"message":...}` response.
-///
-/// # Safety
-/// `kind` is only ever passed `&'static str` literals (e.g. `"pointer"`,
-/// `"keyboard"`) so no JSON escaping is required.  If dynamic strings are
-/// ever passed, switch to `serde_json::json!`.
 fn make_error(code: &str, message: &str, kind: Option<&str>) -> String {
-    let kind_json = kind.map_or(String::new(), |k| format!(",\"kind\":\"{}\"", k));
-    format!(
-        "{{\"status\":\"error\",\"code\":\"{}\",\"message\":\"{}\"{}}}",
-        code,
-        message.replace('"', "\\\""),
-        kind_json
-    ) + "\n"
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "status".to_string(),
+        serde_json::Value::String("error".to_string()),
+    );
+    obj.insert(
+        "code".to_string(),
+        serde_json::Value::String(code.to_string()),
+    );
+    obj.insert(
+        "message".to_string(),
+        serde_json::Value::String(message.to_string()),
+    );
+    if let Some(k) = kind {
+        obj.insert("kind".to_string(), serde_json::Value::String(k.to_string()));
+    }
+    serde_json::Value::Object(obj).to_string() + "\n"
 }
 
 /// Build the handshake acknowledgement line.
@@ -788,69 +793,88 @@ unsafe fn dispatch_scroll(axis: u32, value: f64) {
 // IPC command handling
 // ---------------------------------------------------------------------------
 
-/// Parse one JSON request line and produce a JSON response line.
-fn handle_request(line: &str) -> String {
-    if line.contains("\"type\":\"hello\"") {
-        return make_hello_ack();
-    }
+/// Result of handling one JSON request line.
+enum HandleResult {
+    /// Normal JSON response to write back to the host.
+    Response(String),
+    /// The host requested unload — the IPC thread should clean up and exit.
+    Unload,
+}
 
+/// Parse one JSON request line and produce a response.
+fn handle_request(line: &str) -> HandleResult {
     let req: IpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
-        Err(_) => return make_error("invalid_json", "could not parse request", None),
+        Err(_) => {
+            return HandleResult::Response(make_error(
+                "invalid_json",
+                "could not parse request",
+                None,
+            ));
+        }
     };
 
     match req.ty.as_str() {
+        "hello" => HandleResult::Response(make_hello_ack()),
         "mouse_move" => {
             let x = req.x.unwrap_or(0.0);
             let y = req.y.unwrap_or(0.0);
-            queue_cmd(IpcCommand::MouseMove { x, y })
+            HandleResult::Response(queue_cmd(IpcCommand::MouseMove { x, y }))
         }
         "mouse_button" => {
             let button = req.button.unwrap_or(0);
             let pressed = req.state.as_deref() == Some("pressed");
-            queue_cmd(IpcCommand::MouseButton { button, pressed })
+            HandleResult::Response(queue_cmd(IpcCommand::MouseButton { button, pressed }))
         }
         "key" => {
             let key = req.key.unwrap_or(0);
             let pressed = req.state.as_deref() == Some("pressed");
-            queue_cmd(IpcCommand::Key { key, pressed })
+            HandleResult::Response(queue_cmd(IpcCommand::Key { key, pressed }))
         }
         "scroll" => {
             let axis = req.axis.unwrap_or(0);
             let value = req.value.unwrap_or(0.0);
-            queue_cmd(IpcCommand::Scroll { axis, value })
+            HandleResult::Response(queue_cmd(IpcCommand::Scroll { axis, value }))
         }
         "surface_size" => {
             if G_XDG_TOPLEVEL.load(Ordering::Acquire).is_null() {
-                return make_error(
+                return HandleResult::Response(make_error(
                     "proxy_not_found",
                     "xdg_toplevel not captured yet",
                     Some("xdg_toplevel"),
-                );
+                ));
             }
             let w = G_SURFACE_W.load(Ordering::Acquire);
             let h = G_SURFACE_H.load(Ordering::Acquire);
             if w == 0 || h == 0 {
-                return make_error(
+                return HandleResult::Response(make_error(
                     "proxy_not_found",
                     "surface size not yet configured",
                     Some("xdg_toplevel"),
-                );
+                ));
             }
-            make_ok_size(w, h)
+            HandleResult::Response(make_ok_size(w, h))
         }
         "rescan" => {
             let display = G_DISPLAY.load(Ordering::Acquire);
             if display.is_null() {
-                return make_error("dispatch_hook_not_installed", "display not yet seen", None);
+                return HandleResult::Response(make_error(
+                    "dispatch_hook_not_installed",
+                    "display not yet seen",
+                    None,
+                ));
             }
             // SAFETY: `display` was stored by the dispatch hook and is valid.
             unsafe { initial_sweep(display) };
-            make_ok()
+            HandleResult::Response(make_ok())
         }
-        "unload" => make_ok(),
-        "status" => make_status(),
-        _ => make_error("unknown_command", "unrecognized request type", None),
+        "unload" => HandleResult::Unload,
+        "status" => HandleResult::Response(make_status()),
+        _ => HandleResult::Response(make_error(
+            "unknown_command",
+            "unrecognized request type",
+            None,
+        )),
     }
 }
 
@@ -918,12 +942,15 @@ fn ipc_thread() {
             continue;
         }
 
-        let response = handle_request(line_trimmed);
-        let _ = write_stream.write_all(response.as_bytes());
-
-        if line_trimmed.contains("\"type\":\"unload\"") {
-            let _ = std::fs::remove_file(&sock_path);
-            break;
+        match handle_request(line_trimmed) {
+            HandleResult::Response(response) => {
+                let _ = write_stream.write_all(response.as_bytes());
+            }
+            HandleResult::Unload => {
+                let _ = write_stream.write_all(make_ok().as_bytes());
+                let _ = std::fs::remove_file(&sock_path);
+                break;
+            }
         }
         line.clear();
     }
