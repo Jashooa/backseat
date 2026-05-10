@@ -167,10 +167,9 @@ static IPC_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 /// Look up the *real* libwayland symbol via `dlsym(RTLD_NEXT, …)`.
 ///
 /// # Safety
-/// `name` must be a null-terminated byte slice.
-unsafe fn get_real(name: &[u8]) -> Option<*mut c_void> {
-    let sym = CStr::from_bytes_with_nul(name).unwrap();
-    let ptr = libc::dlsym(libc::RTLD_NEXT, sym.as_ptr());
+/// `name` must be a valid C string.
+unsafe fn get_real(name: &CStr) -> Option<*mut c_void> {
+    let ptr = libc::dlsym(libc::RTLD_NEXT, name.as_ptr());
     if ptr.is_null() {
         None
     } else {
@@ -234,7 +233,7 @@ unsafe fn run_hooks(display: *mut c_void) {
 #[no_mangle]
 pub unsafe extern "C" fn wl_display_dispatch(display: *mut c_void) -> c_int {
     run_hooks(display);
-    let real = get_real(b"wl_display_dispatch\0");
+    let real = get_real(c"wl_display_dispatch");
     match real {
         Some(f) => {
             std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void) -> c_int>(f)(display)
@@ -251,7 +250,7 @@ pub unsafe extern "C" fn wl_display_dispatch(display: *mut c_void) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn wl_display_dispatch_pending(display: *mut c_void) -> c_int {
     run_hooks(display);
-    let real = get_real(b"wl_display_dispatch_pending\0");
+    let real = get_real(c"wl_display_dispatch_pending");
     match real {
         Some(f) => {
             std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void) -> c_int>(f)(display)
@@ -272,7 +271,7 @@ pub unsafe extern "C" fn wl_registry_bind(
     interface: *const wl_interface,
     version: u32,
 ) -> *mut c_void {
-    let real = get_real(b"wl_registry_bind\0");
+    let real = get_real(c"wl_registry_bind");
     let proxy = match real {
         Some(f) => {
             let func = std::mem::transmute::<
@@ -299,7 +298,7 @@ pub unsafe extern "C" fn wl_registry_bind(
 /// `seat` must be a valid `wl_seat *`.
 #[no_mangle]
 pub unsafe extern "C" fn wl_seat_get_pointer(seat: *mut c_void) -> *mut c_void {
-    let real = get_real(b"wl_seat_get_pointer\0");
+    let real = get_real(c"wl_seat_get_pointer");
     let proxy = match real {
         Some(f) => {
             let func =
@@ -320,7 +319,7 @@ pub unsafe extern "C" fn wl_seat_get_pointer(seat: *mut c_void) -> *mut c_void {
 /// `seat` must be a valid `wl_seat *`.
 #[no_mangle]
 pub unsafe extern "C" fn wl_seat_get_keyboard(seat: *mut c_void) -> *mut c_void {
-    let real = get_real(b"wl_seat_get_keyboard\0");
+    let real = get_real(c"wl_seat_get_keyboard");
     let proxy = match real {
         Some(f) => {
             let func =
@@ -400,7 +399,7 @@ pub unsafe extern "C" fn wl_proxy_add_listener(
     implementation: *mut *mut c_void,
     data: *mut c_void,
 ) -> c_int {
-    let real = get_real(b"wl_proxy_add_listener\0");
+    let real = get_real(c"wl_proxy_add_listener");
 
     let iface_name = proxy_interface_name(proxy);
     if let Some(name) = iface_name {
@@ -460,7 +459,7 @@ pub unsafe extern "C" fn wl_proxy_add_listener(
 /// `proxy` must be a valid `wl_proxy *`.
 #[no_mangle]
 pub unsafe extern "C" fn wl_proxy_destroy(proxy: *mut c_void) {
-    let real = get_real(b"wl_proxy_destroy\0");
+    let real = get_real(c"wl_proxy_destroy");
     // Prune our listener table before the proxy is freed.
     TOPLEVEL_LISTENERS
         .lock()
@@ -502,7 +501,7 @@ pub unsafe extern "C" fn wl_proxy_marshal_flags(
 ) -> *mut c_void {
     let real = REAL_MARSHAL_FLAGS.load(Ordering::Relaxed);
     let real = if real.is_null() {
-        if let Some(p) = get_real(b"wl_proxy_marshal_flags\0") {
+        if let Some(p) = get_real(c"wl_proxy_marshal_flags") {
             REAL_MARSHAL_FLAGS.store(p, Ordering::Relaxed);
             p
         } else {
@@ -1086,12 +1085,7 @@ extern "C" fn init() {
         // dispatches.  (For BIND_NOW targets the PLT was already resolved and
         // this check may still return our address — the only definitive test
         // is whether run_hooks fires, tracked by G_DISPATCH_CALLED.)
-        let sym = unsafe {
-            libc::dlsym(
-                libc::RTLD_DEFAULT,
-                b"wl_display_dispatch\0".as_ptr() as *const i8,
-            )
-        };
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"wl_display_dispatch".as_ptr()) };
         let ours = wl_display_dispatch as *const () as usize as *mut c_void;
         G_INTERPOSITION_OK.store(sym == ours, Ordering::Release);
         std::thread::spawn(ipc_thread);
