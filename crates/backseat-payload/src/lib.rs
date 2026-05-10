@@ -474,16 +474,20 @@ pub unsafe extern "C" fn wl_proxy_destroy(proxy: *mut c_void) {
 
 const WL_MARSHAL_FLAG_DESTROY: u32 = 1 << 0;
 
+/// Cached real pointer for `wl_proxy_marshal_flags` so we don't call
+/// `dlsym` on the hot path.
+static REAL_MARSHAL_FLAGS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Shadow for `wl_proxy_marshal_flags`.
 ///
 /// Modern apps destroy xdg_toplevel via `wl_proxy_marshal_flags(..., WL_MARSHAL_FLAG_DESTROY)`,
 /// which routes through an internal `wl_proxy_destroy_caller_locks` path that
-/// bypasses the public `wl_proxy_destroy` PLT entry.  We shadow this too so
-/// that destroyed toplevels are pruned from `TOPLEVEL_LISTENERS`.
+/// bypasses the public `wl_proxy_destroy` PLT entry.
 ///
-/// On x86-64 the System-V ABI places all fixed arguments in registers; any
-/// variadic arguments remain in registers / on the stack and are forwarded
-/// to the real function unchanged.
+/// The real symbol is variadic.  We use inline asm to forward all
+/// register and stack arguments unchanged, clearing `%al` so the real
+/// function's `va_start` does not try to read garbage from vector
+/// registers.
 ///
 /// # Safety
 /// `proxy` must be a valid `wl_proxy *`.
@@ -494,23 +498,57 @@ pub unsafe extern "C" fn wl_proxy_marshal_flags(
     interface: *const c_void,
     version: u32,
     flags: u32,
+    // variadic args follow in r9, r10, r11 and on the stack
 ) -> *mut c_void {
-    if flags & WL_MARSHAL_FLAG_DESTROY != 0 {
-        TOPLEVEL_LISTENERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(k, _, _)| *k != proxy as usize);
-    }
-    let real = get_real(b"wl_proxy_marshal_flags\0");
-    if let Some(f) = real {
-        let func = std::mem::transmute::<
-            *mut c_void,
-            unsafe extern "C" fn(*mut c_void, u32, *const c_void, u32, u32) -> *mut c_void,
-        >(f);
-        func(proxy, opcode, interface, version, flags)
+    let real = REAL_MARSHAL_FLAGS.load(Ordering::Relaxed);
+    let real = if real.is_null() {
+        if let Some(p) = get_real(b"wl_proxy_marshal_flags\0") {
+            REAL_MARSHAL_FLAGS.store(p, Ordering::Relaxed);
+            p
+        } else {
+            return std::ptr::null_mut();
+        }
     } else {
-        std::ptr::null_mut()
+        real
+    };
+
+    let mut result: *mut c_void = std::ptr::null_mut();
+    std::arch::asm!(
+        "xor eax, eax",
+        "call r12",
+        in("r12") real,
+        lateout("rax") result,
+        in("rdi") proxy,
+        in("rsi") opcode,
+        in("rdx") interface,
+        in("rcx") version,
+        in("r8") flags,
+        lateout("r9") _, lateout("r10") _, lateout("r11") _,
+        lateout("xmm0") _, lateout("xmm1") _, lateout("xmm2") _,
+        lateout("xmm3") _, lateout("xmm4") _, lateout("xmm5") _,
+        lateout("xmm6") _, lateout("xmm7") _,
+    );
+
+    // Side effects: prune destroyed toplevels, capture new proxies.
+    if !result.is_null() && !interface.is_null() {
+        if flags & WL_MARSHAL_FLAG_DESTROY != 0 {
+            TOPLEVEL_LISTENERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(k, _, _)| *k != proxy as usize);
+        }
+
+        let iface_name = CStr::from_ptr((*(interface as *const wl_interface)).name).to_bytes();
+        if iface_name == b"wl_pointer" {
+            G_POINTER.store(result, Ordering::Release);
+        } else if iface_name == b"wl_keyboard" {
+            G_KEYBOARD.store(result, Ordering::Release);
+        } else if iface_name == b"xdg_toplevel" {
+            G_XDG_TOPLEVEL.store(result, Ordering::Release);
+        }
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
