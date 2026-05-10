@@ -26,6 +26,7 @@ use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -863,17 +864,33 @@ fn queue_cmd(cmd: IpcCommand) -> String {
 // IPC thread
 // ---------------------------------------------------------------------------
 
+/// Return a suitable runtime directory for temporary files.
+///
+/// Prefers `$XDG_RUNTIME_DIR` (user-owned, typically `/run/user/<uid>`),
+/// falling back to `/tmp`.  Must match the host's `session::runtime_dir()`.
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// Accept a single IPC connection and process newline-delimited JSON requests
 /// until the host sends `unload` or the connection closes.
 fn ipc_thread() {
     let pid = unsafe { libc::getpid() };
-    let sock_path = format!("/tmp/backseat-{}.sock", pid);
+    let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
+    let sock_path_cstring = std::ffi::CString::new(sock_path.to_string_lossy().as_bytes()).unwrap();
     let _ = std::fs::remove_file(&sock_path);
 
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(_) => return,
     };
+
+    // Restrict socket permissions so only the owner can connect.
+    unsafe {
+        libc::chmod(sock_path_cstring.as_ptr(), 0o700);
+    }
 
     let (stream, _) = match listener.accept() {
         Ok(v) => v,
