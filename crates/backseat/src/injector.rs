@@ -610,4 +610,16 @@ mod tests {
         }
         assert!(find_symbol_offset(&data, "dlopen").is_none());
     }
+
+    #[test]
+    fn errno_from_nix_roundtrip() {
+        // nix::Error is a repr(i32) enum where the discriminant equals the
+        // errno value.  This test guards against a future nix bump that
+        // changes the representation and silently misreports errnos.
+        assert_eq!(errno_from_nix(nix::Error::EPERM), libc::EPERM);
+        assert_eq!(errno_from_nix(nix::Error::ESRCH), libc::ESRCH);
+        assert_eq!(errno_from_nix(nix::Error::EACCES), libc::EACCES);
+        assert_eq!(errno_from_nix(nix::Error::EINVAL), libc::EINVAL);
+        assert_eq!(errno_from_nix(nix::Error::EIO), libc::EIO);
+    }
 }
