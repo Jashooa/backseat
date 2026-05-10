@@ -753,13 +753,21 @@ unsafe fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
 /// Retrieve a function pointer from a `wl_proxy`'s listener struct at the
 /// given `offset` (in pointer-sized units).
 ///
+/// Returns `None` for dispatcher-style proxies (wayland-rs, winit, etc.)
+/// which use a `dispatcher` callback instead of a listener function table.
+/// Full dispatcher support is not yet implemented.
+///
 /// # Safety
 /// `proxy` must be a valid `wl_proxy *` with a non-null listener.
 unsafe fn get_listener_func(proxy: *mut c_void, offset: usize) -> Option<*mut c_void> {
     if proxy.is_null() {
         return None;
     }
-    let listener = (*proxy.cast::<wl_proxy>()).object.implementation;
+    let p = proxy.cast::<wl_proxy>();
+    if !(*p).dispatcher.is_null() {
+        return None;
+    }
+    let listener = (*p).object.implementation;
     if listener.is_null() {
         return None;
     }

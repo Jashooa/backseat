@@ -147,6 +147,9 @@ and no attempt is made to conceal the injection.
   another thread is inside `dlopen`/`dlsym` at the moment of injection.
 - PID reuse is possible (but unlikely) between `Session::from_name` resolution
   and `ptrace::attach`.  Use `Session::new(pid)` when stability is critical.
+- Dispatcher-style proxies (`wl_proxy_add_dispatcher`, used by `wayland-rs`,
+  winit, iced, COSMIC, etc.) are not yet supported.  Synthetic events will
+  silently fail for these clients until dispatcher support is implemented.
 
 ## Development
 
