@@ -257,15 +257,175 @@ mod tests {
         assert_eq!(Key::Raw(99).linux_keycode(), 99);
     }
 
+    /// Spot-check one key from each family to catch copy-paste errors.
+    #[test]
+    fn keycodes_spot_check_families() {
+        // Arrow keys
+        assert_eq!(Key::Up.linux_keycode(), 103);
+        assert_eq!(Key::Down.linux_keycode(), 108);
+        assert_eq!(Key::Left.linux_keycode(), 105);
+        assert_eq!(Key::Right.linux_keycode(), 106);
+        // F-keys
+        assert_eq!(Key::F1.linux_keycode(), 59);
+        assert_eq!(Key::F12.linux_keycode(), 88);
+        // Modifiers
+        assert_eq!(Key::LeftShift.linux_keycode(), 42);
+        assert_eq!(Key::RightShift.linux_keycode(), 54);
+        assert_eq!(Key::LeftCtrl.linux_keycode(), 29);
+        assert_eq!(Key::RightCtrl.linux_keycode(), 97);
+        assert_eq!(Key::LeftAlt.linux_keycode(), 56);
+        assert_eq!(Key::RightAlt.linux_keycode(), 100);
+        assert_eq!(Key::LeftMeta.linux_keycode(), 125);
+        assert_eq!(Key::RightMeta.linux_keycode(), 126);
+        // Navigation
+        assert_eq!(Key::Home.linux_keycode(), 102);
+        assert_eq!(Key::End.linux_keycode(), 107);
+        assert_eq!(Key::PageUp.linux_keycode(), 104);
+        assert_eq!(Key::PageDown.linux_keycode(), 109);
+        assert_eq!(Key::Insert.linux_keycode(), 110);
+        assert_eq!(Key::Delete.linux_keycode(), 111);
+        // Special
+        assert_eq!(Key::Escape.linux_keycode(), 1);
+        assert_eq!(Key::Backspace.linux_keycode(), 14);
+        assert_eq!(Key::Tab.linux_keycode(), 15);
+        assert_eq!(Key::CapsLock.linux_keycode(), 58);
+        assert_eq!(Key::PrintScreen.linux_keycode(), 99);
+        assert_eq!(Key::ScrollLock.linux_keycode(), 70);
+        assert_eq!(Key::Pause.linux_keycode(), 119);
+    }
+
+    /// All named Key variants must have unique keycodes — a copy-paste
+    /// duplicate would silently map two keys to the same scancode.
+    #[test]
+    fn keycodes_no_duplicates() {
+        use std::collections::HashSet;
+        let codes: Vec<u32> = KEY_VARIANTS.iter().map(|k| k.linux_keycode()).collect();
+        let unique: HashSet<u32> = codes.iter().copied().collect();
+        assert_eq!(
+            codes.len(),
+            unique.len(),
+            "duplicate keycodes found: {:?}",
+            {
+                let mut seen = HashSet::new();
+                codes
+                    .iter()
+                    .filter(|c| !seen.insert(**c))
+                    .copied()
+                    .collect::<Vec<u32>>()
+            }
+        );
+    }
+
+    /// A static list of every named Key variant (excluding Raw), used by
+    /// the duplicate-detection test above.
+    static KEY_VARIANTS: &[Key] = &[
+        Key::A,
+        Key::B,
+        Key::C,
+        Key::D,
+        Key::E,
+        Key::F,
+        Key::G,
+        Key::H,
+        Key::I,
+        Key::J,
+        Key::K,
+        Key::L,
+        Key::M,
+        Key::N,
+        Key::O,
+        Key::P,
+        Key::Q,
+        Key::R,
+        Key::S,
+        Key::T,
+        Key::U,
+        Key::V,
+        Key::W,
+        Key::X,
+        Key::Y,
+        Key::Z,
+        Key::Num0,
+        Key::Num1,
+        Key::Num2,
+        Key::Num3,
+        Key::Num4,
+        Key::Num5,
+        Key::Num6,
+        Key::Num7,
+        Key::Num8,
+        Key::Num9,
+        Key::F1,
+        Key::F2,
+        Key::F3,
+        Key::F4,
+        Key::F5,
+        Key::F6,
+        Key::F7,
+        Key::F8,
+        Key::F9,
+        Key::F10,
+        Key::F11,
+        Key::F12,
+        Key::Up,
+        Key::Down,
+        Key::Left,
+        Key::Right,
+        Key::Home,
+        Key::End,
+        Key::PageUp,
+        Key::PageDown,
+        Key::Insert,
+        Key::Delete,
+        Key::LeftShift,
+        Key::RightShift,
+        Key::LeftCtrl,
+        Key::RightCtrl,
+        Key::LeftAlt,
+        Key::RightAlt,
+        Key::LeftMeta,
+        Key::RightMeta,
+        Key::Enter,
+        Key::Escape,
+        Key::Tab,
+        Key::Backspace,
+        Key::Space,
+        Key::CapsLock,
+        Key::PrintScreen,
+        Key::ScrollLock,
+        Key::Pause,
+        Key::Minus,
+        Key::Equal,
+        Key::LeftBrace,
+        Key::RightBrace,
+        Key::Backslash,
+        Key::Semicolon,
+        Key::Apostrophe,
+        Key::Grave,
+        Key::Comma,
+        Key::Dot,
+        Key::Slash,
+    ];
+
     #[test]
     fn button_codes() {
         assert_eq!(Button::Left.linux_code(), 0x110);
         assert_eq!(Button::Right.linux_code(), 0x111);
+        assert_eq!(Button::Middle.linux_code(), 0x112);
+        assert_eq!(Button::Back.linux_code(), 0x113);
+        assert_eq!(Button::Forward.linux_code(), 0x114);
     }
 
     #[test]
     fn axis_codes() {
         assert_eq!(Axis::Vertical.wayland_axis(), 0);
         assert_eq!(Axis::Horizontal.wayland_axis(), 1);
+    }
+
+    #[test]
+    fn key_display() {
+        assert_eq!(Key::A.to_string(), "A");
+        assert_eq!(Key::Enter.to_string(), "Enter");
+        assert_eq!(Key::Raw(42).to_string(), "Raw(42)");
     }
 }

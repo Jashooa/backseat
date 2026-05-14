@@ -223,18 +223,110 @@ fn ascii_to_key(ch: char) -> Result<(Key, bool), Error> {
 mod tests {
     use super::*;
 
+    // -------------------------------------------------------------------
+    // ascii_to_key — full character mapping table
+    // -------------------------------------------------------------------
+
+    /// Every recognized ASCII character mapping, checked exhaustively.
+    /// Format: (character, expected Key, needs_shift).
+    #[rustfmt::skip]
+    static MAPPINGS: &[(char, Key, bool)] = &[
+        // Lowercase letters
+        ('a', Key::A, false), ('b', Key::B, false), ('c', Key::C, false),
+        ('d', Key::D, false), ('e', Key::E, false), ('f', Key::F, false),
+        ('g', Key::G, false), ('h', Key::H, false), ('i', Key::I, false),
+        ('j', Key::J, false), ('k', Key::K, false), ('l', Key::L, false),
+        ('m', Key::M, false), ('n', Key::N, false), ('o', Key::O, false),
+        ('p', Key::P, false), ('q', Key::Q, false), ('r', Key::R, false),
+        ('s', Key::S, false), ('t', Key::T, false), ('u', Key::U, false),
+        ('v', Key::V, false), ('w', Key::W, false), ('x', Key::X, false),
+        ('y', Key::Y, false), ('z', Key::Z, false),
+        // Uppercase letters (shift = true)
+        ('A', Key::A, true), ('B', Key::B, true), ('C', Key::C, true),
+        ('D', Key::D, true), ('E', Key::E, true), ('F', Key::F, true),
+        ('G', Key::G, true), ('H', Key::H, true), ('I', Key::I, true),
+        ('J', Key::J, true), ('K', Key::K, true), ('L', Key::L, true),
+        ('M', Key::M, true), ('N', Key::N, true), ('O', Key::O, true),
+        ('P', Key::P, true), ('Q', Key::Q, true), ('R', Key::R, true),
+        ('S', Key::S, true), ('T', Key::T, true), ('U', Key::U, true),
+        ('V', Key::V, true), ('W', Key::W, true), ('X', Key::X, true),
+        ('Y', Key::Y, true), ('Z', Key::Z, true),
+        // Digits
+        ('0', Key::Num0, false), ('1', Key::Num1, false),
+        ('2', Key::Num2, false), ('3', Key::Num3, false),
+        ('4', Key::Num4, false), ('5', Key::Num5, false),
+        ('6', Key::Num6, false), ('7', Key::Num7, false),
+        ('8', Key::Num8, false), ('9', Key::Num9, false),
+        // Whitespace
+        (' ', Key::Space, false), ('\n', Key::Enter, false), ('\t', Key::Tab, false),
+        // Unshifted punctuation
+        ('-', Key::Minus, false), ('=', Key::Equal, false),
+        ('[', Key::LeftBrace, false), (']', Key::RightBrace, false),
+        ('\\', Key::Backslash, false), (';', Key::Semicolon, false),
+        ('\'', Key::Apostrophe, false), ('`', Key::Grave, false),
+        (',', Key::Comma, false), ('.', Key::Dot, false),
+        ('/', Key::Slash, false),
+        // Shifted punctuation
+        ('_', Key::Minus, true), ('+', Key::Equal, true),
+        ('{', Key::LeftBrace, true), ('}', Key::RightBrace, true),
+        ('|', Key::Backslash, true), (':', Key::Semicolon, true),
+        ('"', Key::Apostrophe, true), ('~', Key::Grave, true),
+        ('<', Key::Comma, true), ('>', Key::Dot, true),
+        ('?', Key::Slash, true),
+        // Shifted digits
+        ('!', Key::Num1, true), ('@', Key::Num2, true),
+        ('#', Key::Num3, true), ('$', Key::Num4, true),
+        ('%', Key::Num5, true), ('^', Key::Num6, true),
+        ('&', Key::Num7, true), ('*', Key::Num8, true),
+        ('(', Key::Num9, true), (')', Key::Num0, true),
+    ];
+
     #[test]
-    fn ascii_to_key_recognised() {
-        assert_eq!(ascii_to_key('a').unwrap(), (Key::A, false));
-        assert_eq!(ascii_to_key('A').unwrap(), (Key::A, true));
-        assert_eq!(ascii_to_key('1').unwrap(), (Key::Num1, false));
-        assert_eq!(ascii_to_key(' ').unwrap(), (Key::Space, false));
+    fn ascii_to_key_table() {
+        for &(ch, expected_key, expected_shift) in MAPPINGS {
+            let (key, shift) = ascii_to_key(ch)
+                .unwrap_or_else(|e| panic!("ascii_to_key({ch:?}) should succeed, got {e}"));
+            assert_eq!(
+                key, expected_key,
+                "ascii_to_key({ch:?}) key mismatch: got {key:?}, expected {expected_key:?}"
+            );
+            assert_eq!(
+                shift, expected_shift,
+                "ascii_to_key({ch:?}) shift mismatch: got {shift}, expected {expected_shift}"
+            );
+        }
     }
 
     #[test]
-    fn ascii_to_key_unrecognised() {
-        assert!(
-            matches!(ascii_to_key('€'), Err(Error::SocketError(msg)) if msg.contains("unsupported"))
-        );
+    fn ascii_to_key_all_lowercase() {
+        for letter in 'a'..='z' {
+            assert!(
+                ascii_to_key(letter).is_ok(),
+                "lowercase '{letter}' not mapped"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_to_key_unrecognised_unicode() {
+        assert!(matches!(
+            ascii_to_key('€'),
+            Err(Error::SocketError(msg)) if msg.contains("unsupported")
+        ));
+    }
+
+    #[test]
+    fn ascii_to_key_unrecognised_control() {
+        // ASCII control characters (0x00–0x1F, except \t and \n) are not mapped.
+        for byte in 0u8..=0x1Fu8 {
+            let ch = byte as char;
+            if ch == '\t' || ch == '\n' {
+                continue;
+            }
+            assert!(
+                ascii_to_key(ch).is_err(),
+                "control character U+{byte:04X} should be unsupported"
+            );
+        }
     }
 }

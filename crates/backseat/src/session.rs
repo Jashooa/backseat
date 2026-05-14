@@ -485,4 +485,39 @@ mod tests {
         let e = map_ipc_error("proxy_not_found", "msg", None);
         assert!(matches!(e, crate::error::Error::SocketError(_)));
     }
+
+    #[test]
+    fn map_ipc_error_dispatch_hook_not_installed() {
+        let e = map_ipc_error("dispatch_hook_not_installed", "not ready", None);
+        assert!(matches!(e, crate::error::Error::DispatchHookNotInstalled));
+    }
+
+    #[test]
+    fn map_ipc_error_unknown_code_falls_back_to_socket_error() {
+        let e = map_ipc_error("bogus_code", "some detail", None);
+        assert!(matches!(e, crate::error::Error::SocketError(msg) if msg == "some detail"));
+    }
+
+    #[test]
+    fn map_ipc_error_proxy_not_found_all_kinds() {
+        for (kind_str, expected_kind) in [
+            ("pointer", crate::error::ProxyKind::Pointer),
+            ("keyboard", crate::error::ProxyKind::Keyboard),
+            ("seat", crate::error::ProxyKind::Seat),
+            ("xdg_surface", crate::error::ProxyKind::XdgSurface),
+            ("xdg_toplevel", crate::error::ProxyKind::XdgToplevel),
+        ] {
+            let e = map_ipc_error("proxy_not_found", "msg", Some(kind_str));
+            assert!(
+                matches!(e, crate::error::Error::ProxyNotFound { kind } if kind == expected_kind),
+                "kind_str={kind_str}: got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_ipc_error_proxy_not_found_unknown_kind_falls_back() {
+        let e = map_ipc_error("proxy_not_found", "msg", Some("garbage_kind"));
+        assert!(matches!(e, crate::error::Error::SocketError(_)));
+    }
 }

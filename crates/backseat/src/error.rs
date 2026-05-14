@@ -175,16 +175,92 @@ mod tests {
         assert!(e.to_string().contains("expected 1, got 2"));
     }
 
+    /// Construct every error variant and verify Display produces a non-empty
+    /// message containing something identifiable.
     #[test]
-    fn ptrace_op_display() {
-        assert_eq!(PtraceOp::Attach.to_string(), "attach");
-        assert_eq!(PtraceOp::PokeData.to_string(), "pokedata");
+    fn all_error_variants_have_display() {
+        let errors: &[(&str, Error)] = &[
+            ("PermissionDenied", Error::PermissionDenied(42)),
+            ("DlopenReturnedNull", Error::DlopenReturnedNull { pid: 99 }),
+            (
+                "PtraceFailed",
+                Error::PtraceFailed {
+                    pid: 1,
+                    op: PtraceOp::Attach,
+                    errno: 3,
+                },
+            ),
+            (
+                "ShellcodeWriteFailed",
+                Error::ShellcodeWriteFailed {
+                    pid: 2,
+                    addr: 0x1000,
+                    errno: 5,
+                },
+            ),
+            (
+                "PayloadExtractFailed",
+                Error::PayloadExtractFailed("oops".into()),
+            ),
+            (
+                "LibcResolutionFailed",
+                Error::LibcResolutionFailed { pid: 7 },
+            ),
+            (
+                "SocketTimeout",
+                Error::SocketTimeout {
+                    phase: SocketPhase::Connect,
+                },
+            ),
+            ("SocketError", Error::SocketError("bad".into())),
+            ("Disconnected", Error::Disconnected),
+            (
+                "ProxyNotFound",
+                Error::ProxyNotFound {
+                    kind: ProxyKind::Keyboard,
+                },
+            ),
+            (
+                "ListenerNull",
+                Error::ListenerNull {
+                    kind: ProxyKind::Pointer,
+                },
+            ),
+            ("DispatchHookNotInstalled", Error::DispatchHookNotInstalled),
+            ("UnloadFailed", Error::UnloadFailed("cleanup".into())),
+        ];
+        for (name, err) in errors {
+            let msg = err.to_string();
+            assert!(!msg.is_empty(), "Error::{name} produced empty Display");
+        }
     }
 
     #[test]
-    fn socket_phase_display() {
+    fn ptrace_op_display_all() {
+        assert_eq!(PtraceOp::Attach.to_string(), "attach");
+        assert_eq!(PtraceOp::Detach.to_string(), "detach");
+        assert_eq!(PtraceOp::GetRegs.to_string(), "getregs");
+        assert_eq!(PtraceOp::SetRegs.to_string(), "setregs");
+        assert_eq!(PtraceOp::Cont.to_string(), "cont");
+        assert_eq!(PtraceOp::PokeData.to_string(), "pokedata");
+        assert_eq!(PtraceOp::PokeText.to_string(), "poketext");
+    }
+
+    #[test]
+    fn socket_phase_display_all() {
+        assert_eq!(SocketPhase::Bind.to_string(), "bind");
         assert_eq!(SocketPhase::Connect.to_string(), "connect");
         assert_eq!(SocketPhase::Handshake.to_string(), "handshake");
+        assert_eq!(SocketPhase::Call.to_string(), "call");
+    }
+
+    #[test]
+    fn proxy_kind_display_all() {
+        assert_eq!(ProxyKind::Pointer.to_string(), "pointer");
+        assert_eq!(ProxyKind::Keyboard.to_string(), "keyboard");
+        assert_eq!(ProxyKind::Seat.to_string(), "seat");
+        assert_eq!(ProxyKind::XdgSurface.to_string(), "xdg_surface");
+        assert_eq!(ProxyKind::XdgToplevel.to_string(), "xdg_toplevel");
     }
 
     #[test]

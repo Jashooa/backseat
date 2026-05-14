@@ -119,3 +119,27 @@ impl Mouse {
         send_command(&mut s, cmd).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Helper: create a Mouse handle backed by a dummy socket pair so the
+    /// Mutex can be initialised without a real Wayland connection.
+    fn dummy_mouse() -> Mouse {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let stream = tokio::net::UnixStream::from_std(a).unwrap();
+        Mouse::new(Arc::new(tokio::sync::Mutex::new(stream)))
+    }
+
+    #[tokio::test]
+    async fn move_by_returns_unsupported_error() {
+        let mouse = dummy_mouse();
+        let result = mouse.move_by(10.0, 20.0).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("move_by") || msg.contains("v0.2"));
+    }
+}

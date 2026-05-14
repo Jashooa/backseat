@@ -454,6 +454,90 @@ mod tests {
         assert_eq!(sc.len(), 73);
     }
 
+    /// Verify the exact byte sequence for a known set of addresses.
+    /// A single wrong opcode or endian-swapped immediate silently
+    /// corrupts the target process during injection.
+    #[test]
+    fn shellcode_byte_sequence() {
+        // Use addresses with distinct byte patterns so endianness bugs
+        // are caught at a glance.
+        let sc = make_shellcode(
+            0x0000_0001_0203_0405, // dlopen_addr
+            0x1011_1213_1415_1617, // dlsym_addr
+            0x2021_2223_2425_2627, // payload_path_addr
+            0x3031_3233_3435_3637, // socket_path_addr
+            0x4041_4243_4445_4647, // symbol_name_addr
+        );
+
+        // Build the expected bytes manually so we're not just calling
+        // the same function we're testing.
+        let mut expected = Vec::with_capacity(80);
+
+        // movabs rdi, payload_path_addr
+        expected.extend_from_slice(&[0x48, 0xBF]);
+        expected.extend_from_slice(&0x2021_2223_2425_2627u64.to_le_bytes());
+        // movabs rsi, RTLD_NOW (2)
+        expected.extend_from_slice(&[0x48, 0xBE]);
+        expected.extend_from_slice(&2u64.to_le_bytes());
+        // movabs rax, dlopen_addr
+        expected.extend_from_slice(&[0x48, 0xB8]);
+        expected.extend_from_slice(&0x0000_0001_0203_0405u64.to_le_bytes());
+        // call rax
+        expected.extend_from_slice(&[0xFF, 0xD0]);
+        // mov rbx, rax
+        expected.extend_from_slice(&[0x48, 0x89, 0xC3]);
+        // mov rdi, rbx
+        expected.extend_from_slice(&[0x48, 0x89, 0xDF]);
+        // movabs rsi, symbol_name_addr
+        expected.extend_from_slice(&[0x48, 0xBE]);
+        expected.extend_from_slice(&0x4041_4243_4445_4647u64.to_le_bytes());
+        // movabs rax, dlsym_addr
+        expected.extend_from_slice(&[0x48, 0xB8]);
+        expected.extend_from_slice(&0x1011_1213_1415_1617u64.to_le_bytes());
+        // call rax
+        expected.extend_from_slice(&[0xFF, 0xD0]);
+        // movabs rdi, socket_path_addr
+        expected.extend_from_slice(&[0x48, 0xBF]);
+        expected.extend_from_slice(&0x3031_3233_3435_3637u64.to_le_bytes());
+        // call rax
+        expected.extend_from_slice(&[0xFF, 0xD0]);
+        // int3
+        expected.push(0xCC);
+
+        assert_eq!(sc, expected, "shellcode byte sequence mismatch");
+    }
+
+    /// The shellcode should handle zero addresses (e.g. if a symbol
+    /// happens to be at offset 0 in a library).
+    #[test]
+    fn shellcode_zero_addresses() {
+        let sc = make_shellcode(0, 0, 0, 0, 0);
+        assert_eq!(sc.len(), 73);
+        // RTLD_NOW immediate is at bytes 12–19 (movabs rsi follows
+        // movabs rdi + 8-byte immediate at bytes 0–9).
+        let rsi_imm: [u8; 8] = sc[12..20].try_into().unwrap();
+        assert_eq!(u64::from_le_bytes(rsi_imm), 2, "RTLD_NOW constant is wrong");
+    }
+
+    /// The RTLD_NOW constant must be exactly 2 (RTLD_NOW=2 on Linux).
+    #[test]
+    fn shellcode_rtld_now_constant() {
+        let sc = make_shellcode(1, 2, 3, 4, 5);
+        // Bytes 12–19: the movabs rsi immediate.
+        let imm: [u8; 8] = sc[12..20].try_into().unwrap();
+        let val = u64::from_le_bytes(imm);
+        assert_eq!(
+            val,
+            libc::RTLD_NOW as u64,
+            "RTLD_NOW constant embedded in shellcode doesn't match libc::RTLD_NOW"
+        );
+        assert_eq!(
+            libc::RTLD_NOW,
+            2,
+            "RTLD_NOW changed — update shellcode test"
+        );
+    }
+
     #[test]
     fn find_symbol_on_non_elf() {
         assert!(find_symbol_offset(b"not an elf", "dlopen").is_none());
