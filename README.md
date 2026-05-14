@@ -137,11 +137,13 @@ match Session::from_name("myapp").await {
 
 ## Architecture
 
-The crate is a Cargo workspace with two crates:
+`backseat` is a single Rust crate. It includes:
 
-- **`backseat`** — the published API crate. It builds an injected shared
-  library (the "payload") from vendored source at compile time, performs
-  ptrace injection, and handles IPC over a per-process Unix socket.
+- **Library** (`src/`) — the public API for ptrace injection, IPC, and input
+  synthesis.  The injected shared library (the "payload") is built at compile
+  time from vendored source in `src/payload/lib.rs`.
+- **Test fixture** (`src/bin/fixture.rs`) — a minimal Wayland client compiled
+  as an optional binary behind the `fixture` feature, used by integration tests.
 
 ## Security
 
@@ -198,8 +200,7 @@ engine:
 ```bash
 sudo apt-get install weston libwayland-dev
 echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
-cargo build -p backseat-test-fixture
-cargo test --workspace
+cargo test --features fixture
 ```
 
 The compositor is started with `--fake-seat --no-outputs` so that input

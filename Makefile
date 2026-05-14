@@ -1,25 +1,22 @@
 # Local development helpers
 
-.PHONY: all fmt clippy test test-all integration setup-hooks build-fixture
+.PHONY: all fmt clippy test test-all integration setup-hooks
 
 all: fmt clippy test
 
 fmt:
-	cargo fmt --all
+	cargo fmt
 
 clippy:
-	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --features fixture -- -D warnings
 
-build-fixture:
-	cargo build -p backseat-test-fixture
-
-test: build-fixture
-	cargo test --workspace
+test:
+	cargo test --features fixture
 
 # Force-run integration tests even if skip/prerequisites fail.
 # Requires: weston installed, ptrace_scope = 0.
-integration: build-fixture
-	cargo test -p backseat --test integration -- --nocapture
+integration:
+	cargo test --test integration --features fixture -- --nocapture
 
 test-all: test
 

@@ -19,24 +19,24 @@ ok()    { echo -e "  ${GREEN}PASS${NC} ${1}"; }
 fail()  { echo -e "  ${RED}FAIL${NC} ${1}"; exit 1; }
 
 # ── fmt ────────────────────────────────────────────────────────────────
-step "cargo fmt --all -- --check"
-if cargo fmt --all -- --check 2>&1; then
+step "cargo fmt -- --check"
+if cargo fmt -- --check 2>&1; then
     ok "fmt"
 else
     fail "Run 'make fmt' to apply formatting."
 fi
 
 # ── clippy ─────────────────────────────────────────────────────────────
-step "cargo clippy --workspace --all-targets --all-features -- -D warnings"
-if cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1; then
+step "cargo clippy --all-targets --features fixture -- -D warnings"
+if cargo clippy --all-targets --features fixture -- -D warnings 2>&1; then
     ok "clippy"
 else
     fail "Fix clippy warnings before committing."
 fi
 
 # ── test ───────────────────────────────────────────────────────────────
-step "cargo test -p backseat"
-if cargo test -p backseat 2>&1; then
+step "cargo test --features fixture"
+if cargo test --features fixture 2>&1; then
     ok "tests"
 else
     fail "Tests failed."

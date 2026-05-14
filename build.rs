@@ -15,6 +15,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", vendored_src.display());
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Force lazy PLT binding so the ptrace-injected payload can interpose
+    // libwayland-client symbols in the test fixture.
+    println!("cargo:rustc-link-arg=-Wl,-z,lazy");
+
     let vendored_project = out_dir.join("payload-project");
     let vendored_src_dir = vendored_project.join("src");
     std::fs::create_dir_all(&vendored_src_dir).expect("failed to create payload src dir");
