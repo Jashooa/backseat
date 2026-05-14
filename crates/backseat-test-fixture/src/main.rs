@@ -297,6 +297,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 };
                 print_event(&format!("EVENT: button {s} {button}"));
             }
+            wl_pointer::Event::Axis { axis, value, .. } => {
+                let s = match axis {
+                    wayland_client::WEnum::Value(v) => match v {
+                        wl_pointer::Axis::VerticalScroll => "vertical",
+                        wl_pointer::Axis::HorizontalScroll => "horizontal",
+                        _ => "unknown",
+                    },
+                    wayland_client::WEnum::Unknown(_) => return,
+                };
+                print_event(&format!("EVENT: axis {s} {value}"));
+            }
             wl_pointer::Event::Frame => {
                 // Wayland 1.10+ frame event — we don't need to print it,
                 // the test cares about button/motion events.

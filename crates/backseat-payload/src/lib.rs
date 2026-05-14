@@ -616,6 +616,26 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                 }
             }
         }
+        IpcCommand::Scroll { axis, amount } => {
+            if let Some(ptr) = get_pointer_proxy() {
+                unsafe {
+                    let mut args = [
+                        wl_argument { u: ms },
+                        wl_argument { u: axis },
+                        wl_argument {
+                            f: to_fixed(amount),
+                        },
+                    ];
+                    invoke_dispatcher(ptr, 4 /* axis */, &mut args);
+                    // Emit frame event for v5+ pointers so clients
+                    // commit the axis event batch.  Without the frame,
+                    // v5+ clients may discard the scroll.
+                    if (*ptr.cast::<wl_proxy>()).version >= 5 {
+                        invoke_dispatcher(ptr, 5 /* frame */, &mut []);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -657,14 +677,35 @@ struct IpcRequest {
     key: Option<u32>,
     #[serde(default)]
     depressed: Option<u32>,
+    #[serde(default)]
+    axis: Option<u32>,
+    #[serde(default)]
+    value: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
 enum IpcCommand {
-    MouseMove { x: f64, y: f64 },
-    MouseButton { button: u32, state: u32 },
-    Key { key: u32, state: u32 },
-    Modifiers { depressed: u32 },
+    MouseMove {
+        x: f64,
+        y: f64,
+    },
+    MouseButton {
+        button: u32,
+        state: u32,
+    },
+    Key {
+        key: u32,
+        state: u32,
+    },
+    Modifiers {
+        depressed: u32,
+    },
+    /// Axis scroll event: `axis` is the Wayland axis identifier
+    /// (0=vertical, 1=horizontal), `amount` in logical scroll units.
+    Scroll {
+        axis: u32,
+        amount: f64,
+    },
 }
 
 #[derive(Debug)]
@@ -724,6 +765,15 @@ fn handle_request(line: &str) -> HandleResult {
             {
                 let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                 q.push_back(IpcCommand::Modifiers { depressed });
+            }
+            HandleResult::Response(make_ok())
+        }
+        "scroll" => {
+            let axis = req.axis.unwrap_or(0);
+            let amount = req.value.unwrap_or(0.0);
+            {
+                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                q.push_back(IpcCommand::Scroll { axis, amount });
             }
             HandleResult::Response(make_ok())
         }

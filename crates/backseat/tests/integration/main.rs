@@ -251,6 +251,33 @@ async fn mouse_click_is_received_by_target() {
 }
 
 #[tokio::test]
+async fn mouse_scroll_is_received_by_target() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
+    let _guard = SUITE_LOCK.lock().await;
+    let env = TestEnv::start();
+    let pid = env.pid();
+    let session = Session::new(pid).await.expect("Session::new failed");
+    reregister_input(pid);
+
+    session
+        .mouse
+        .scroll(backseat::keys::Axis::Vertical, 10.0)
+        .await
+        .expect("scroll failed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let lines = env.read_events(1);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("EVENT: axis") && l.contains("vertical")),
+        "missing axis event: {lines:?}"
+    );
+}
+
+#[tokio::test]
 async fn type_text_is_received_by_target() {
     if let Err(reason) = check_prerequisites() {
         eprintln!("SKIP: {reason}");
