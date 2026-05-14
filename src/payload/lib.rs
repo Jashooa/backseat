@@ -208,21 +208,29 @@ unsafe fn install_toplevel_shim(toplevel: *mut c_void) {
     if impl_ptr.is_null() {
         return;
     }
-    let func = *impl_ptr;
-    if func == 0 {
+    let orig_configure = *impl_ptr;
+    if orig_configure == 0 {
         return;
     }
-    let data = *impl_ptr.add(1);
+    // For listener-style proxies the vtable is at impl_ptr (configure,
+    // close, configure_bounds, wm_capabilities).  The user data lives
+    // in (*proxy).user_data, NOT in impl_ptr[1] which is the 'close'
+    // function pointer.  Using impl_ptr[1] would pass a function
+    // pointer as the user-data argument to the original configure
+    // callback, crashing GTK / Qt / raw C clients.
+    let user_data = (*proxy).user_data as usize;
 
     let mut listeners = TOPLEVEL_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
     let key = toplevel as usize;
     if listeners.iter().any(|(k, _, _)| *k == key) {
         return;
     }
-    listeners.push((key, func, data));
+    listeners.push((key, orig_configure, user_data));
 
+    // Only overwrite the configure slot — leave the rest of the
+    // listener vtable (close, configure_bounds, wm_capabilities)
+    // untouched so the app's other callbacks still fire.
     *impl_ptr = toplevel_configure_shim as *const () as usize;
-    *impl_ptr.add(1) = data;
 }
 
 extern "C" fn toplevel_configure_shim(
@@ -468,6 +476,16 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
         _ => return,
     };
 
+    // Compute load_bias: for PIE binaries r_offset is relative to the
+    // first PT_LOAD segment's p_vaddr.  Using base + r_offset directly
+    // only works when p_vaddr == 0 (typical modern PIE).  For ET_EXEC
+    // or PIE with non-zero p_vaddr, we must subtract p_vaddr.
+    let load_bias = elf
+        .program_headers
+        .iter()
+        .find(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
+        .map_or(base, |ph| base.wrapping_sub(ph.p_vaddr as usize));
+
     // Walk .rela.plt and .rela.dyn relocations.
     let relocs: Vec<_> = elf.pltrelocs.iter().chain(elf.dynrelas.iter()).collect();
 
@@ -487,7 +505,7 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
             continue;
         }
 
-        let got_entry = (base + rela.r_offset as usize) as *mut *mut c_void;
+        let got_entry = (load_bias + rela.r_offset as usize) as *mut *mut c_void;
 
         // Save the real pointer.
         let real = *got_entry;
