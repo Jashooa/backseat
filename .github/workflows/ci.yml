@@ -33,5 +33,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run unit + doc tests (integration requires Wayland)
-        run: cargo test --workspace --lib --bins --doc
+      - name: Run unit tests
+        run: cargo test --workspace --lib --bins
+      - name: Run doc tests
+        run: cargo test --workspace --doc
