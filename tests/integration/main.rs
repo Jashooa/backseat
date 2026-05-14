@@ -23,6 +23,9 @@ static SUITE_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Returns `Ok(())` if the local machine has `weston` and ptrace
 /// available, or `Err(reason)` describing what's missing.
+///
+/// When `CI=1` is set in the environment, missing prerequisites cause
+/// a hard failure instead of silently skipping tests.
 fn check_prerequisites() -> Result<(), String> {
     if std::process::Command::new("weston")
         .arg("--version")
@@ -39,6 +42,20 @@ fn check_prerequisites() -> Result<(), String> {
         Err(_) => {} // no yama, ptrace unrestricted
     }
     Ok(())
+}
+
+/// Gate for every test: skip locally unless BACKSEAT_INTEGRATION=1, but
+/// hard-fail in CI so we don't silently skip tests on GitHub Actions.
+fn skip_unless_ready() -> bool {
+    if let Err(reason) = check_prerequisites() {
+        let in_ci = std::env::var("CI").as_deref() == Ok("1");
+        if in_ci {
+            panic!("CI=1 but prerequisites not met: {reason}");
+        }
+        eprintln!("SKIP: {reason}");
+        return true;
+    }
+    false
 }
 
 /// A running compositor + fixture pair.  Dropping this struct kills both
@@ -103,8 +120,7 @@ async fn wait_for_socket_gone(pid: u32) {
 
 #[tokio::test]
 async fn inject_and_unload() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -123,8 +139,7 @@ async fn inject_and_unload() {
 
 #[tokio::test]
 async fn drop_auto_unloads() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -140,8 +155,7 @@ async fn drop_auto_unloads() {
 
 #[tokio::test]
 async fn reinject_after_unload_works() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -160,8 +174,7 @@ async fn reinject_after_unload_works() {
 
 #[tokio::test]
 async fn session_from_name_finds_process() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -194,8 +207,7 @@ fn reregister_input(pid: u32) {
 
 #[tokio::test]
 async fn key_tap_is_received_by_target() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -223,8 +235,7 @@ async fn key_tap_is_received_by_target() {
 
 #[tokio::test]
 async fn mouse_click_is_received_by_target() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -252,8 +263,7 @@ async fn mouse_click_is_received_by_target() {
 
 #[tokio::test]
 async fn mouse_scroll_is_received_by_target() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -279,8 +289,7 @@ async fn mouse_scroll_is_received_by_target() {
 
 #[tokio::test]
 async fn type_text_is_received_by_target() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
@@ -316,8 +325,7 @@ async fn type_text_is_received_by_target() {
 
 #[tokio::test]
 async fn combo_is_received_by_target() {
-    if let Err(reason) = check_prerequisites() {
-        eprintln!("SKIP: {reason}");
+    if skip_unless_ready() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;

@@ -347,20 +347,12 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let pid = self.pid;
-        let stream = self.stream.clone();
-        // Best-effort async cleanup in a blocking task.
-        let _ = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new();
-            if let Ok(rt) = rt {
-                rt.block_on(async {
-                    let mut s = stream.lock().await;
-                    let _ = send_line(&mut s, &Command::new("unload")).await;
-                    let _ = s.shutdown().await;
-                    let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
-                    let _ = tokio::fs::remove_file(&sock_path).await;
-                });
-            }
-        });
+        // Best-effort cleanup: remove the socket file.  The payload
+        // will notice the disconnect and exit its IPC thread after
+        // a short timeout.  Always prefer calling [`Session::unload`]
+        // explicitly for a clean shutdown.
+        let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
+        let _ = std::fs::remove_file(&sock_path);
     }
 }
 

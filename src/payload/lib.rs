@@ -17,7 +17,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // libwayland internal structures (ABI-stable across libwayland 1.x)
@@ -127,7 +127,6 @@ static G_SEAT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static G_XDG_TOPLEVEL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static G_SURFACE_W: AtomicU32 = AtomicU32::new(0);
 static G_SURFACE_H: AtomicU32 = AtomicU32::new(0);
-static G_DISPLAY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static G_DISPATCH_CALLED: AtomicBool = AtomicBool::new(false);
 static G_INITIAL_SWEEP_DONE: AtomicBool = AtomicBool::new(false);
 static G_HOST_PID: AtomicU32 = AtomicU32::new(0);
@@ -143,8 +142,6 @@ static REAL_ADD_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-toplevel saved listener state: `(toplevel_addr, orig_func, orig_data)`.
 static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
-
-unsafe impl Send for wl_proxy {}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -261,11 +258,14 @@ unsafe fn initial_sweep(display: *mut c_void) {
     if !entries.is_null() && count > 0 {
         let slice = std::slice::from_raw_parts(entries, count);
         for &entry_val in slice.iter() {
-            // Skip free-list entries and NULL.
-            // On x86_64 valid heap pointers always exceed u32::MAX,
-            // whereas free-list entries are small u32 indices.
-            if entry_val > u32::MAX as usize {
-                capture_proxy(entry_val as *mut c_void);
+            // Skip free-list entries and NULL.  libwayland stores
+            // WL_MAP_ENTRY_LEGACY / WL_MAP_ENTRY_ZOMBIE flags in the
+            // low two bits; mask them out before interpreting as a
+            // pointer.  On x86_64 valid heap pointers always exceed
+            // u32::MAX, whereas free-list entries are small u32 indices.
+            let entry_ptr = (entry_val & !0x3usize) as *mut c_void;
+            if entry_ptr as usize > u32::MAX as usize && !entry_ptr.is_null() {
+                capture_proxy(entry_ptr);
             }
         }
     }
@@ -324,7 +324,6 @@ unsafe fn sweep_event_queues() {
 // ---------------------------------------------------------------------------
 
 unsafe fn run_hooks(display: *mut c_void) {
-    G_DISPLAY.store(display, Ordering::Release);
     G_DISPATCH_CALLED.store(true, Ordering::Release);
 
     if !G_INITIAL_SWEEP_DONE.swap(true, Ordering::SeqCst) {
@@ -825,9 +824,10 @@ fn handle_request(line: &str) -> HandleResult {
         }
         "surface_size" => {
             if G_XDG_TOPLEVEL.load(Ordering::Acquire).is_null() {
-                return HandleResult::Response(make_error(
+                return HandleResult::Response(make_error_with_kind(
                     "proxy_not_found",
                     "xdg_toplevel not captured yet",
+                    "xdg_toplevel",
                 ));
             }
             let w = G_SURFACE_W.load(Ordering::Acquire);
@@ -864,6 +864,27 @@ fn make_error(code: &str, message: &str) -> String {
     serde_json::to_string(&m).unwrap()
 }
 
+fn make_error_with_kind(code: &str, message: &str, kind: &str) -> String {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "status".to_string(),
+        serde_json::Value::String("error".to_string()),
+    );
+    m.insert(
+        "code".to_string(),
+        serde_json::Value::String(code.to_string()),
+    );
+    m.insert(
+        "message".to_string(),
+        serde_json::Value::String(message.to_string()),
+    );
+    m.insert(
+        "kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    serde_json::to_string(&m).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // IPC thread
 // ---------------------------------------------------------------------------
@@ -875,25 +896,16 @@ fn runtime_dir() -> PathBuf {
 }
 
 /// Buffer that holds the socket path passed in by the host.
-static mut BACKSEAT_SOCK_PATH: [u8; 256] = [0; 256];
+/// OnceLock avoids the data race of the previous static mut.
+static BACKSEAT_SOCK_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 fn ipc_thread() {
     let pid = unsafe { libc::getpid() };
 
-    let sock_path = unsafe {
-        let buf_ptr = std::ptr::addr_of!(BACKSEAT_SOCK_PATH).cast::<u8>();
-        if *buf_ptr != 0 {
-            let mut len = 0usize;
-            while len < 256 && *buf_ptr.add(len) != 0 {
-                len += 1;
-            }
-            PathBuf::from(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                buf_ptr, len,
-            )))
-        } else {
-            runtime_dir().join(format!("backseat-{}.sock", pid))
-        }
-    };
+    let sock_path = BACKSEAT_SOCK_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| runtime_dir().join(format!("backseat-{}.sock", pid)));
 
     let sock_path_cstring = std::ffi::CString::new(sock_path.to_string_lossy().as_bytes()).unwrap();
     let _ = std::fs::remove_file(&sock_path);
@@ -1050,16 +1062,13 @@ extern "C" fn init() {
 #[no_mangle]
 pub unsafe extern "C" fn backseat_init(path: *const c_char) {
     if !path.is_null() {
-        let bytes = CStr::from_ptr(path).to_bytes_with_nul();
-        let len = bytes.len().min(256);
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            std::ptr::addr_of_mut!(BACKSEAT_SOCK_PATH).cast::<u8>(),
-            len,
-        );
+        let cstr = CStr::from_ptr(path);
+        if let Ok(s) = cstr.to_str() {
+            let _ = BACKSEAT_SOCK_PATH.set(PathBuf::from(s));
+        }
         // The host PID is written immediately after the socket path's
         // null terminator in the target's memory (see injector.rs).
-        let host_pid_ptr = path.add(bytes.len()).cast::<u32>();
+        let host_pid_ptr = path.add(cstr.to_bytes_with_nul().len()).cast::<u32>();
         G_HOST_PID.store(host_pid_ptr.read_unaligned(), Ordering::SeqCst);
     }
 
