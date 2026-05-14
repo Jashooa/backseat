@@ -8,6 +8,6 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-wayland-client = { version = "=0.31.14", default-features = false }
+wayland-client = { version = "=0.31.14", default-features = false, features = ["system"] }
 wayland-protocols = { version = "=0.32.12", features = ["client", "staging"], default-features = false }
 libc = "0.2"

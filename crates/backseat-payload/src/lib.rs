@@ -123,6 +123,7 @@ static REAL_DISPATCH: AtomicUsize = AtomicUsize::new(0);
 static REAL_DISPATCH_PENDING: AtomicUsize = AtomicUsize::new(0);
 static REAL_DISPATCH_QUEUE: AtomicUsize = AtomicUsize::new(0);
 static REAL_DISPATCH_QUEUE_PENDING: AtomicUsize = AtomicUsize::new(0);
+static REAL_ADD_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-toplevel saved listener state: `(toplevel_addr, orig_func, orig_data)`.
 static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -152,6 +153,7 @@ fn store_real(symbol: &str, ptr: *mut c_void) {
         "wl_display_dispatch_pending" => &REAL_DISPATCH_PENDING,
         "wl_display_dispatch_queue" => &REAL_DISPATCH_QUEUE,
         "wl_display_dispatch_queue_pending" => &REAL_DISPATCH_QUEUE_PENDING,
+        "wl_proxy_add_dispatcher" => &REAL_ADD_DISPATCHER,
         _ => return,
     };
     target.store(ptr as usize, Ordering::SeqCst);
@@ -178,19 +180,19 @@ unsafe fn capture_proxy(proxy: *mut c_void) {
 
 unsafe fn install_toplevel_shim(toplevel: *mut c_void) {
     let proxy = toplevel as *mut wl_proxy;
+
+    // Dispatcher proxies store a sentinel (&RUST_MANAGED) in
+    // object.implementation, not a listener table.  Writing to that
+    // address would corrupt the wayland-backend static.
+    if !(*proxy).dispatcher.is_null() {
+        return;
+    }
+
     let impl_ptr = (*proxy).object.implementation as *mut usize;
     if impl_ptr.is_null() {
         return;
     }
-    // Skip if the implementation pointer is not 8-byte aligned — this
-    // indicates a dispatcher-managed proxy (not a listener array).
-    if (impl_ptr as usize) & 7 != 0 {
-        return;
-    }
     let func = *impl_ptr;
-    // Skip if the "function pointer" at impl_ptr[0] doesn't look like
-    // a code pointer (dispatcher proxies store a single function here,
-    // not a listener table with user-data at +1).
     if func == 0 {
         return;
     }
@@ -229,17 +231,61 @@ extern "C" fn toplevel_configure_shim(
 unsafe fn initial_sweep(display: *mut c_void) {
     let d = display as *mut wl_display_header;
     let map = &(*d).objects;
-    let entries = map.client_entries.data as *const *mut c_void;
-    let count = map.client_entries.size / std::mem::size_of::<*mut c_void>();
+    let entries = map.client_entries.data as *const usize;
+    let count = map.client_entries.size / std::mem::size_of::<usize>();
 
-    if entries.is_null() || count == 0 {
-        return;
-    }
-    let slice = std::slice::from_raw_parts(entries, count);
-    for &proxy_ptr in slice.iter() {
-        if !proxy_ptr.is_null() {
-            capture_proxy(proxy_ptr);
+    if !entries.is_null() && count > 0 {
+        let slice = std::slice::from_raw_parts(entries, count);
+        for &entry_val in slice.iter() {
+            // Skip free-list entries and NULL.
+            // On x86_64 valid heap pointers always exceed u32::MAX,
+            // whereas free-list entries are small u32 indices.
+            if entry_val > u32::MAX as usize {
+                capture_proxy(entry_val as *mut c_void);
+            }
         }
+    }
+
+    // Walk the proxy_list of every captured proxy's event queue to
+    // pick up proxies that were removed from the wl_map (seat,
+    // pointer, keyboard are frequent casualties of the wrapper
+    // pattern in wayland-backend's send_request).
+    sweep_event_queues();
+}
+
+/// Walk the proxy_list of the event queue that each already-captured
+/// proxy belongs to.  Deduplication is handled by `capture_proxy`
+/// itself (the globals will only store the first pointer per type).
+unsafe fn sweep_event_queues() {
+    // Collect the event queue pointer from the first non-display proxy
+    // we captured — all application proxies share the same queue.
+    let queue = {
+        let mut found: *mut c_void = std::ptr::null_mut();
+        for atomic in [&G_SEAT, &G_POINTER, &G_KEYBOARD, &G_XDG_TOPLEVEL] {
+            let p = atomic.load(Ordering::Acquire);
+            if !p.is_null() {
+                let proxy = p as *mut wl_proxy;
+                let q = (*proxy).queue;
+                if !q.is_null() {
+                    found = q;
+                    break;
+                }
+            }
+        }
+        found
+    };
+
+    let q = queue as *mut wl_event_queue;
+    let head = &(*q).proxy_list as *const wl_list as *mut wl_list;
+    let mut cur = (*head).next;
+
+    while cur != head && !cur.is_null() {
+        // The proxy is embedded inside wl_proxy.queue_link — offset
+        // back to the start of the wl_proxy struct.
+        let link_offset = 80usize;
+        let proxy = (cur as usize - link_offset) as *mut c_void;
+        capture_proxy(proxy);
+        cur = (*cur).next;
     }
 }
 
@@ -297,6 +343,18 @@ unsafe extern "C" fn hook_dispatch_queue_pending(
     let real: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
         std::mem::transmute(REAL_DISPATCH_QUEUE_PENDING.load(Ordering::SeqCst));
     real(display, queue)
+}
+
+unsafe extern "C" fn hook_add_dispatcher(
+    proxy: *mut c_void,
+    dispatcher: *mut c_void,
+    implementation: *const c_void,
+    data: *mut c_void,
+) {
+    capture_proxy(proxy);
+    let real: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) =
+        std::mem::transmute(REAL_ADD_DISPATCHER.load(Ordering::SeqCst));
+    real(proxy, dispatcher, implementation, data);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,67 +502,42 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
 }
 
 // ---------------------------------------------------------------------------
-// Synthetic input dispatch
+// Synthetic input dispatch — calls the proxy's dispatcher directly.
 // ---------------------------------------------------------------------------
 
-fn dispatch_event(display: *mut c_void, cmd: IpcCommand) {
-    match cmd {
-        IpcCommand::MouseMove { x, y } => {
-            if let Some(ptr) = get_pointer_proxy() {
-                unsafe {
-                    let serial = next_serial();
-                    wl_pointer_motion(ptr, serial, display, x, y);
-                }
-            }
-        }
-        IpcCommand::MouseButton { button, state } => {
-            if let Some(ptr) = get_pointer_proxy() {
-                unsafe {
-                    let serial = next_serial();
-                    wl_pointer_button(ptr, serial, display, button, state);
-                }
-            }
-        }
-        IpcCommand::Key { key, state } => {
-            if let Some(kbd) = get_keyboard_proxy() {
-                unsafe {
-                    let serial = next_serial();
-                    wl_keyboard_key(kbd, serial, display, key, state);
-                }
-            }
-        }
-        IpcCommand::Modifiers { depressed } => {
-            if let Some(kbd) = get_keyboard_proxy() {
-                unsafe {
-                    let serial = next_serial();
-                    wl_keyboard_modifiers(kbd, serial, display, depressed);
-                }
-            }
-        }
-    }
+/// Matches libwayland's `union wl_argument`.
+#[repr(C)]
+union wl_argument {
+    i: i32,
+    u: u32,
+    f: i32, // wl_fixed_t
+    s: *const c_char,
+    o: *mut c_void,
+    n: u32,
+    a: *mut c_void,
+    h: i32,
 }
 
-fn get_pointer_proxy() -> Option<*mut c_void> {
-    let p = G_POINTER.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(p)
-    }
-}
+/// Signature of the dispatcher installed by wayland-backend.
+type DispatcherFn = unsafe extern "C" fn(
+    *const c_void,
+    *mut c_void,
+    u32,
+    *const c_void,
+    *const wl_argument,
+) -> c_int;
 
-fn get_keyboard_proxy() -> Option<*mut c_void> {
-    let p = G_KEYBOARD.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(p)
+unsafe fn invoke_dispatcher(proxy: *mut c_void, opcode: u32, args: &mut [wl_argument]) -> bool {
+    let p = proxy as *mut wl_proxy;
+    let dispatcher_ptr = (*p).dispatcher;
+    if dispatcher_ptr.is_null() {
+        return false;
     }
+    let disp: DispatcherFn = std::mem::transmute(dispatcher_ptr);
+    let impl_ptr = (*p).object.implementation;
+    let _ = disp(impl_ptr, proxy, opcode, std::ptr::null(), args.as_ptr());
+    true
 }
-
-// ---------------------------------------------------------------------------
-// libwayland protocol helpers
-// ---------------------------------------------------------------------------
 
 static SERIAL: AtomicU32 = AtomicU32::new(1);
 
@@ -527,82 +560,81 @@ fn to_fixed(v: f64) -> i32 {
     (v * 256.0).round() as i32
 }
 
-/// Emulate `wl_pointer.motion`.
-unsafe fn wl_pointer_motion(
-    proxy: *mut c_void,
-    serial: u32,
-    _display: *mut c_void,
-    x: f64,
-    y: f64,
-) {
-    let mut args: [u64; 4] = [
-        serial as u64,
-        monotonic_ms() as u64,
-        to_fixed(x) as u64,
-        to_fixed(y) as u64,
-    ];
-    wl_proxy_marshal(proxy, 4, args.as_mut_ptr());
-    wl_proxy_marshal(proxy, 5, args.as_mut_ptr());
+fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
+    let serial = next_serial();
+    let ms = monotonic_ms();
+    match cmd {
+        IpcCommand::MouseMove { x, y } => {
+            if let Some(ptr) = get_pointer_proxy() {
+                unsafe {
+                    let mut args = [
+                        wl_argument { u: ms },
+                        wl_argument { f: to_fixed(x) },
+                        wl_argument { f: to_fixed(y) },
+                    ];
+                    invoke_dispatcher(ptr, 2 /* motion */, &mut args);
+                }
+            }
+        }
+        IpcCommand::MouseButton { button, state } => {
+            if let Some(ptr) = get_pointer_proxy() {
+                unsafe {
+                    let mut args = [
+                        wl_argument { u: serial },
+                        wl_argument { u: ms },
+                        wl_argument { u: button },
+                        wl_argument { u: state },
+                    ];
+                    invoke_dispatcher(ptr, 3 /* button */, &mut args);
+                }
+            }
+        }
+        IpcCommand::Key { key, state } => {
+            if let Some(kbd) = get_keyboard_proxy() {
+                unsafe {
+                    let mut args = [
+                        wl_argument { u: serial },
+                        wl_argument { u: ms },
+                        wl_argument { u: key },
+                        wl_argument { u: state },
+                    ];
+                    invoke_dispatcher(kbd, 3 /* key */, &mut args);
+                }
+            }
+        }
+        IpcCommand::Modifiers { depressed } => {
+            if let Some(kbd) = get_keyboard_proxy() {
+                unsafe {
+                    let mut args = [
+                        wl_argument { u: serial },
+                        wl_argument { u: depressed },
+                        wl_argument { u: 0 }, // mods_latched
+                        wl_argument { u: 0 }, // mods_locked
+                        wl_argument { u: 0 }, // group
+                    ];
+                    invoke_dispatcher(kbd, 4 /* modifiers */, &mut args);
+                }
+            }
+        }
+    }
 }
 
-/// Emulate `wl_pointer.button`.
-unsafe fn wl_pointer_button(
-    proxy: *mut c_void,
-    serial: u32,
-    _display: *mut c_void,
-    button: u32,
-    state: u32,
-) {
-    let mut args: [u64; 4] = [
-        serial as u64,
-        monotonic_ms() as u64,
-        button as u64,
-        state as u64,
-    ];
-    wl_proxy_marshal(proxy, 3, args.as_mut_ptr());
-    wl_proxy_marshal(proxy, 5, args.as_mut_ptr());
+fn get_pointer_proxy() -> Option<*mut c_void> {
+    let p = G_POINTER.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
-/// Emulate `wl_keyboard.key`.
-unsafe fn wl_keyboard_key(
-    proxy: *mut c_void,
-    serial: u32,
-    _display: *mut c_void,
-    key: u32,
-    state: u32,
-) {
-    let mut args: [u64; 4] = [
-        serial as u64,
-        monotonic_ms() as u64,
-        key as u64,
-        state as u64,
-    ];
-    wl_proxy_marshal(proxy, 3, args.as_mut_ptr());
-}
-
-/// Emulate `wl_keyboard.modifiers`.
-unsafe fn wl_keyboard_modifiers(
-    proxy: *mut c_void,
-    serial: u32,
-    _display: *mut c_void,
-    depressed: u32,
-) {
-    let mut args: [u64; 5] = [
-        serial as u64,
-        depressed as u64,
-        0, // mods_latched
-        0, // mods_locked
-        0, // group
-    ];
-    wl_proxy_marshal(proxy, 4, args.as_mut_ptr());
-}
-
-/// Low-level proxy marshalling — matches libwayland's `wl_proxy_marshal`.
-unsafe fn wl_proxy_marshal(proxy: *mut c_void, opcode: u32, args: *mut u64) {
-    let func: unsafe extern "C" fn(*mut c_void, u32, ...) =
-        std::mem::transmute(libc::dlsym(libc::RTLD_NEXT, c"wl_proxy_marshal".as_ptr()));
-    let a = std::slice::from_raw_parts(args, 5);
-    func(proxy, opcode, a[0], a[1], a[2], a[3], a[4]);
+fn get_keyboard_proxy() -> Option<*mut c_void> {
+    let p = G_KEYBOARD.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -749,14 +781,6 @@ fn runtime_dir() -> PathBuf {
 /// Buffer that holds the socket path passed in by the host.
 static mut BACKSEAT_SOCK_PATH: [u8; 256] = [0; 256];
 
-fn log(msg: &str) {
-    let _ = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open("/tmp/backseat-debug.log")
-        .and_then(|mut f| f.write_all(msg.as_bytes()));
-}
-
 fn ipc_thread() {
     let pid = unsafe { libc::getpid() };
 
@@ -781,7 +805,6 @@ fn ipc_thread() {
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(_) => {
-            log(&format!("bind failed: {}\n", sock_path.display()));
             IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -793,8 +816,7 @@ fn ipc_thread() {
 
     let (stream, _) = match listener.accept() {
         Ok(v) => v,
-        Err(e) => {
-            log(&format!("accept failed: {}\n", e));
+        Err(_) => {
             IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
             return;
         }
@@ -861,6 +883,10 @@ extern "C" fn init() {
             "wl_display_dispatch_queue_pending",
             hook_dispatch_queue_pending as *mut c_void,
         );
+        patch_all_gots(
+            "wl_proxy_add_dispatcher",
+            hook_add_dispatcher as *mut c_void,
+        );
     }
 }
 
@@ -898,7 +924,7 @@ pub unsafe extern "C" fn backseat_init(path: *const c_char) {
                 std::ptr::null_mut(),
             );
             if ret != 0 {
-                log(&format!("pthread_create failed: {}\n", ret));
+                IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
             }
         }
     }

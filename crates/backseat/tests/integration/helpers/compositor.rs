@@ -38,6 +38,8 @@ impl Compositor {
             &format!("--socket={socket_name}"),
             "--config=/dev/null",
             "--no-config",
+            "--fake-seat",
+            "--no-outputs",
         ])
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("WAYLAND_DISPLAY", &socket_name)

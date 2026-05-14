@@ -69,6 +69,15 @@ impl TestEnv {
     fn pid(&self) -> u32 {
         self.target.lock().unwrap().pid()
     }
+
+    /// Read the next `count` event lines from the fixture (blocks until each
+    /// arrives or the timeout expires).  Panics on timeout or fixture exit.
+    fn read_events(&self, count: usize) -> Vec<String> {
+        let mut target = self.target.lock().unwrap();
+        (0..count)
+            .map(|_| target.next_event(Duration::from_secs(5)))
+            .collect()
+    }
 }
 
 fn socket_path(pid: u32) -> PathBuf {
@@ -168,21 +177,149 @@ async fn session_from_name_finds_process() {
 }
 
 // ---------------------------------------------------------------------------
-// Input event tests — skipped pending dispatcher support in the payload.
+// Input event tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-#[ignore = "requires dispatcher support in payload"]
-async fn key_tap_is_received_by_target() {}
+/// Helper: send SIGUSR2 to the fixture so it re-requests keyboard and
+/// pointer proxies.  The payload's hooked `wl_proxy_add_dispatcher` will
+/// capture them.
+fn reregister_input(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGUSR2);
+    }
+    // Give the fixture a moment to process the signal in its next
+    // dispatch cycle and for the payload's hook to fire.
+    std::thread::sleep(Duration::from_millis(200));
+}
 
 #[tokio::test]
-#[ignore = "requires dispatcher support in payload"]
-async fn mouse_click_is_received_by_target() {}
+async fn key_tap_is_received_by_target() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
+    let _guard = SUITE_LOCK.lock().await;
+    let env = TestEnv::start();
+    let pid = env.pid();
+    let session = Session::new(pid).await.expect("Session::new failed");
+    reregister_input(pid);
+
+    session
+        .keyboard
+        .tap(backseat::keys::Key::A)
+        .await
+        .expect("tap failed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let lines = env.read_events(2);
+    assert!(
+        lines.iter().any(|l| l.contains("key pressed 30")),
+        "missing press: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("key released 30")),
+        "missing release: {lines:?}"
+    );
+}
 
 #[tokio::test]
-#[ignore = "requires dispatcher support in payload"]
-async fn type_text_is_received_by_target() {}
+async fn mouse_click_is_received_by_target() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
+    let _guard = SUITE_LOCK.lock().await;
+    let env = TestEnv::start();
+    let pid = env.pid();
+    let session = Session::new(pid).await.expect("Session::new failed");
+    reregister_input(pid);
+
+    session
+        .mouse
+        .click(backseat::keys::Button::Left)
+        .await
+        .expect("click failed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let lines = env.read_events(2);
+    assert!(
+        lines.iter().any(|l| l.contains("button pressed 272")),
+        "missing press: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("button released 272")),
+        "missing release: {lines:?}"
+    );
+}
 
 #[tokio::test]
-#[ignore = "requires dispatcher support in payload"]
-async fn combo_is_received_by_target() {}
+async fn type_text_is_received_by_target() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
+    let _guard = SUITE_LOCK.lock().await;
+    let env = TestEnv::start();
+    let pid = env.pid();
+    let session = Session::new(pid).await.expect("Session::new failed");
+    reregister_input(pid);
+
+    session
+        .keyboard
+        .type_text("hi")
+        .await
+        .expect("type_text failed");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let lines = env.read_events(4);
+    assert!(
+        lines.iter().any(|l| l.contains("key pressed 35")),
+        "missing h press: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("key released 35")),
+        "missing h release: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("key pressed 23")),
+        "missing i press: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("key released 23")),
+        "missing i release: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn combo_is_received_by_target() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
+    let _guard = SUITE_LOCK.lock().await;
+    let env = TestEnv::start();
+    let pid = env.pid();
+    let session = Session::new(pid).await.expect("Session::new failed");
+    reregister_input(pid);
+
+    session
+        .keyboard
+        .combo(&[backseat::keys::Key::LeftCtrl, backseat::keys::Key::C])
+        .await
+        .expect("combo failed");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let lines = env.read_events(4);
+    assert!(
+        lines.iter().any(|l| l.contains("key pressed 29")),
+        "missing ctrl press: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("key pressed 46")),
+        "missing c press: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("key released 46")),
+        "missing c release: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("key released 29")),
+        "missing ctrl release: {lines:?}"
+    );
+}

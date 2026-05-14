@@ -35,6 +35,7 @@ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_ba
 
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+static REREGISTER_INPUT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigterm(_: libc::c_int) {
     SHOULD_EXIT.store(true, Ordering::SeqCst);
@@ -44,10 +45,15 @@ extern "C" fn handle_sigusr1(_: libc::c_int) {
     RESET_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+extern "C" fn handle_sigusr2(_: libc::c_int) {
+    REREGISTER_INPUT.store(true, Ordering::SeqCst);
+}
+
 fn setup_signals() {
     unsafe {
         libc::signal(libc::SIGTERM, handle_sigterm as *const () as usize);
         libc::signal(libc::SIGUSR1, handle_sigusr1 as *const () as usize);
+        libc::signal(libc::SIGUSR2, handle_sigusr2 as *const () as usize);
     }
 }
 
@@ -120,17 +126,14 @@ impl State {
         self.toplevel = Some(toplevel);
     }
 
-    /// Request pointer and keyboard from the seat if available.
-    fn try_request_input(&mut self, qh: &QueueHandle<Self>) {
+    /// Request fresh pointer and keyboard proxies so the payload can
+    /// capture them via its hooked `wl_proxy_add_dispatcher`.
+    fn force_request_input(&mut self, qh: &QueueHandle<Self>) {
         let Some(seat) = &self.seat else {
             return;
         };
-        if self.pointer.is_none() {
-            self.pointer = Some(seat.get_pointer(qh, ()));
-        }
-        if self.keyboard.is_none() {
-            self.keyboard = Some(seat.get_keyboard(qh, ()));
-        }
+        self.pointer = Some(seat.get_pointer(qh, ()));
+        self.keyboard = Some(seat.get_keyboard(qh, ()));
     }
 }
 
@@ -175,7 +178,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wl_seat" => {
                     state.seat =
                         Some(registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(5), qh, ()));
-                    state.try_request_input(qh);
+                    state.force_request_input(qh);
                 }
                 _ => {}
             }
@@ -421,6 +424,10 @@ fn main() {
             state.keyboard_focused = false;
             state.pointer_focused = false;
             print_event("EVENT: ready");
+        }
+
+        if REREGISTER_INPUT.swap(false, Ordering::SeqCst) {
+            state.force_request_input(&qh);
         }
 
         // Non-blocking dispatch with a short timeout so we can check
