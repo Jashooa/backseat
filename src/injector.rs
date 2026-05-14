@@ -49,7 +49,15 @@ pub fn inject_payload(pid: u32, payload_path: &Path, socket_path: &str) -> Resul
     // 1. Attach
     ptracer
         .attach(pete::Pid::from_raw(pid as i32))
-        .map_err(|e| Error::PayloadExtractFailed(format!("ptrace attach: {e}")))?;
+        .map_err(|e| {
+            if let pete::error::Error::Attach { source, .. } = &e {
+                let msg = format!("{source}");
+                if msg.contains("EPERM") || msg.contains("EACCES") {
+                    return Error::PermissionDenied(pid);
+                }
+            }
+            Error::PayloadExtractFailed(format!("ptrace attach: {e}"))
+        })?;
 
     let tracee = ptracer
         .wait()

@@ -62,15 +62,6 @@ pub enum Error {
     #[error("{kind:?} proxy not found")]
     ProxyNotFound { kind: ProxyKind },
 
-    /// A proxy was found but its listener table is null.
-    #[error("{kind:?} listener is null")]
-    ListenerNull { kind: ProxyKind },
-
-    /// The target application never calls `wl_display_dispatch` (or
-    /// `_pending`), so the dispatch hook cannot fire.
-    #[error("dispatch hook not installed")]
-    DispatchHookNotInstalled,
-
     /// The payload failed to unload cleanly.
     #[error("unload failed: {0}")]
     UnloadFailed(String),
@@ -220,13 +211,6 @@ mod tests {
                     kind: ProxyKind::Keyboard,
                 },
             ),
-            (
-                "ListenerNull",
-                Error::ListenerNull {
-                    kind: ProxyKind::Pointer,
-                },
-            ),
-            ("DispatchHookNotInstalled", Error::DispatchHookNotInstalled),
             ("UnloadFailed", Error::UnloadFailed("cleanup".into())),
         ];
         for (name, err) in errors {

@@ -317,7 +317,6 @@ fn map_ipc_error(code: &str, message: &str, kind: Option<&str>) -> Error {
                 None => Error::SocketError(format!("proxy_not_found: {message}")),
             }
         }
-        "dispatch_hook_not_installed" => Error::DispatchHookNotInstalled,
         _ => Error::SocketError(message.to_string()),
     }
 }
@@ -484,12 +483,6 @@ mod tests {
     fn map_ipc_error_proxy_not_found_without_kind() {
         let e = map_ipc_error("proxy_not_found", "msg", None);
         assert!(matches!(e, crate::error::Error::SocketError(_)));
-    }
-
-    #[test]
-    fn map_ipc_error_dispatch_hook_not_installed() {
-        let e = map_ipc_error("dispatch_hook_not_installed", "not ready", None);
-        assert!(matches!(e, crate::error::Error::DispatchHookNotInstalled));
     }
 
     #[test]
