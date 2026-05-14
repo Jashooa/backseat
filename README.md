@@ -163,6 +163,11 @@ and no attempt is made to conceal the injection.
 - Multithreaded targets: injection attaches the thread group leader while
   other threads continue running.  This can deadlock the dynamic loader if
   another thread is inside `dlopen`/`dlsym` at the moment of injection.
+- **Forking targets are not supported.** If the target process calls `fork()`
+  after injection (common in Firefox content processes, Chromium helpers,
+  GTK file dialogs), the child inherits stale payload state (a dead IPC
+  thread, locked mutexes) and will not receive further input events.
+  The payload does not install `pthread_atfork` handlers to recover.
 - PID reuse is possible (but unlikely) between `Session::from_name` resolution
   and `ptrace::attach`.  Use `Session::new(pid)` when stability is critical.
 - Dispatcher-style proxies (`wl_proxy_add_dispatcher`, used by `wayland-rs`

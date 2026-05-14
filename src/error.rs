@@ -82,6 +82,12 @@ pub enum Error {
     #[error("incompatible libwayland (probe: {probe})")]
     IncompatibleLibwayland { probe: String },
 
+    /// The target process forks after injection (e.g. Firefox content
+    /// processes, Chromium helpers, GTK file dialogs).  The injected
+    /// payload state is not preserved across fork().
+    #[error("target PID {pid} forks after injection (unsupported)")]
+    ForkingTargetUnsupported { pid: u32 },
+
     /// `waitpid` returned an unexpected status during ptrace flow.
     #[error("unexpected wait status during {op:?} for PID {pid}: {status}")]
     UnexpectedWaitStatus {
@@ -244,6 +250,10 @@ mod tests {
                 Error::IncompatibleLibwayland {
                     probe: "offset check".into(),
                 },
+            ),
+            (
+                "ForkingTargetUnsupported",
+                Error::ForkingTargetUnsupported { pid: 42 },
             ),
         ];
         for (name, err) in errors {

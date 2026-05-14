@@ -613,6 +613,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                         wl_argument { f: to_fixed(y) },
                     ];
                     invoke_dispatcher(ptr, 2 /* motion */, &mut args);
+                    emit_frame_if_v5(ptr);
                 }
             }
         }
@@ -626,6 +627,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                         wl_argument { u: state },
                     ];
                     invoke_dispatcher(ptr, 3 /* button */, &mut args);
+                    emit_frame_if_v5(ptr);
                 }
             }
         }
@@ -667,12 +669,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                         },
                     ];
                     invoke_dispatcher(ptr, 4 /* axis */, &mut args);
-                    // Emit frame event for v5+ pointers so clients
-                    // commit the axis event batch.  Without the frame,
-                    // v5+ clients may discard the scroll.
-                    if (*ptr.cast::<wl_proxy>()).version >= 5 {
-                        invoke_dispatcher(ptr, 5 /* frame */, &mut []);
-                    }
+                    emit_frame_if_v5(ptr);
                 }
             }
         }
@@ -685,6 +682,15 @@ fn get_pointer_proxy() -> Option<*mut c_void> {
         None
     } else {
         Some(p)
+    }
+}
+
+/// Emit `wl_pointer.frame` (opcode 5) if the pointer protocol version is
+/// ≥ 5.  Without the frame, v5+ clients batch motion/button/axis events
+/// and discard them as incomplete.
+unsafe fn emit_frame_if_v5(ptr: *mut c_void) {
+    if (*(ptr as *mut wl_proxy)).version >= 5 {
+        invoke_dispatcher(ptr, 5 /* frame */, &mut []);
     }
 }
 
