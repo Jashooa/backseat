@@ -158,8 +158,7 @@ and no attempt is made to conceal the injection.
 
 - x86-64 only (AArch64 deferred)
 - Dynamically-linked `libwayland-client` only
-- `wl_display_dispatch` / `wl_display_dispatch_pending` hook only — apps using
-  `wl_display_roundtrip` exclusively won't trigger the hook
+- `wl_display_dispatch`, `wl_display_dispatch_pending`, `wl_display_dispatch_queue`, and `wl_display_dispatch_queue_pending` hooks only — apps using `wl_display_roundtrip` exclusively won't trigger the hook
 - `move_by` is not supported in v0.2 (no cursor position tracking)
 - ASCII-only text input
 - No XWayland support (deferred to v0.3)
@@ -169,11 +168,14 @@ and no attempt is made to conceal the injection.
 - PID reuse is possible (but unlikely) between `Session::from_name` resolution
   and `ptrace::attach`.  Use `Session::new(pid)` when stability is critical.
 - Dispatcher-style proxies (`wl_proxy_add_dispatcher`, used by `wayland-rs`
-  v0.31+, winit, iced, COSMIC, etc.) are not yet supported.  The payload's
-  `initial_sweep` cannot find dispatcher proxies in the C library's `wl_map`,
-  so `surface_size()`, `G_POINTER`, and `G_KEYBOARD` remain unset.  Synthetic
-  events silently fail for these clients.  Use `wl_proxy_add_listener`-based
-  clients (raw libwayland, `wayland-rs` v0.30, GTK3) for full functionality.
+  v0.31+, winit, iced, COSMIC, etc.) require the target to link against the
+  C `libwayland-client` (the `system` / `client_system` feature in
+  `wayland-backend`).  If the target uses a pure-Rust Wayland backend (the
+  default when `default-features = false` is set without an explicit
+  `features = ["system"]`), keyboard and mouse injection silently does
+  nothing — the payload can't find the input proxies.
+- `surface_size()` is unavailable for dispatcher-proxy clients — the toplevel
+  shim cannot be installed without corrupting the backend's sentinel static.
 
 ## Development
 
@@ -198,11 +200,13 @@ Integration tests require `weston` (headless compositor) and
 ```bash
 sudo apt-get install weston
 echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
-cargo test -p backseat --test integration -- --ignored --test-threads=1
+cargo test --workspace
 ```
 
-Each test starts its own headless compositor and fixture, so no state
-leaks between tests.
+The compositor is started with `--fake-seat --no-outputs` so that input
+proxies (wl_pointer, wl_keyboard) are available even in headless mode.
+Each test starts its own compositor and fixture — no state leaks between
+tests.
 
 ## License
 
