@@ -195,7 +195,9 @@ make integration  # integration tests (requires Wayland + ptrace)
 ```
 
 Integration tests require `weston` (headless compositor) and
-`ptrace_scope = 0`:
+`ptrace_scope = 0`.  They are **not** run in CI (GitHub Actions lacks
+a working compositor).  Run them locally when touching the injection
+engine:
 
 ```bash
 sudo apt-get install weston libwayland-dev

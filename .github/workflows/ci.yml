@@ -33,11 +33,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install system dependencies
-        run: sudo apt-get update -y && sudo apt-get install -y weston libwayland-dev
-      - name: Enable ptrace
-        run: sudo sysctl kernel.yama.ptrace_scope=0
-      - name: Build test fixture
-        run: cargo build -p backseat-test-fixture
-      - name: Run workspace tests
-        run: cargo test --workspace
+      - name: Run unit + doc tests (integration requires Wayland)
+        run: cargo test --workspace --lib --bins --doc
