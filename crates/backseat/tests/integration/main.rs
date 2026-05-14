@@ -3,6 +3,10 @@
 //! Each test that needs Wayland infrastructure creates its own compositor
 //! and fixture, which are cleaned up when the test scope exits (via Drop).
 //! Tests share a `SUITE_LOCK` to run sequentially.
+//!
+//! These tests run by default on Linux when `weston` is found in `$PATH`
+//! and `/proc/sys/kernel/yama/ptrace_scope` is 0.  On systems missing
+//! either prerequisite the tests pass trivially (they do not fail).
 
 mod helpers;
 
@@ -16,6 +20,26 @@ use helpers::compositor::Compositor;
 use helpers::target_app::TargetApp;
 
 static SUITE_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Returns `Ok(())` if the local machine has `weston` and ptrace
+/// available, or `Err(reason)` describing what's missing.
+fn check_prerequisites() -> Result<(), String> {
+    if std::process::Command::new("weston")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        return Err("weston not found in $PATH".into());
+    }
+    match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
+        Ok(s) if s.trim() == "0" => {}
+        Ok(s) => return Err(format!("ptrace_scope is {}, need 0", s.trim())),
+        Err(_) => {} // no yama, ptrace unrestricted
+    }
+    Ok(())
+}
 
 /// A running compositor + fixture pair.  Dropping this struct kills both
 /// child processes, guaranteeing no stale processes survive the test.
@@ -69,8 +93,11 @@ async fn wait_for_socket_gone(pid: u32) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires Wayland + ptrace"]
 async fn inject_and_unload() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
     let _guard = SUITE_LOCK.lock().await;
     let env = TestEnv::start();
 
@@ -83,12 +110,14 @@ async fn inject_and_unload() {
 
     session.unload().await.expect("unload failed");
     wait_for_socket_gone(pid).await;
-    // env dropped here → compositor + fixture killed
 }
 
 #[tokio::test]
-#[ignore = "requires Wayland + ptrace"]
 async fn drop_auto_unloads() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
     let _guard = SUITE_LOCK.lock().await;
     let env = TestEnv::start();
 
@@ -101,8 +130,11 @@ async fn drop_auto_unloads() {
 }
 
 #[tokio::test]
-#[ignore = "requires Wayland + ptrace"]
 async fn reinject_after_unload_works() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
     let _guard = SUITE_LOCK.lock().await;
     let env = TestEnv::start();
 
@@ -118,8 +150,11 @@ async fn reinject_after_unload_works() {
 }
 
 #[tokio::test]
-#[ignore = "requires Wayland + ptrace"]
 async fn session_from_name_finds_process() {
+    if let Err(reason) = check_prerequisites() {
+        eprintln!("SKIP: {reason}");
+        return;
+    }
     let _guard = SUITE_LOCK.lock().await;
     let _env = TestEnv::start();
 

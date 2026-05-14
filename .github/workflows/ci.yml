@@ -31,5 +31,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install weston
+        run: sudo apt-get update -y && sudo apt-get install -y weston
+      - name: Enable ptrace
+        run: sudo sysctl kernel.yama.ptrace_scope=0
       - name: Run workspace tests
         run: cargo test --workspace
