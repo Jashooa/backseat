@@ -66,6 +66,17 @@ pub enum Error {
     #[error("unload failed: {0}")]
     UnloadFailed(String),
 
+    /// The target is sandboxed in a way that prevents ptrace.
+    /// The `reason` field describes the detected sandbox.
+    #[error("target PID {pid} is sandboxed: {reason}")]
+    SandboxedTarget { pid: u32, reason: String },
+
+    /// Yama ptrace_scope blocks tracing non-descendant processes.
+    /// On most distributions this can be relaxed with
+    /// `echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope`.
+    #[error("ptrace_scope is {current} (need 0 to trace arbitrary processes)")]
+    PtraceScopeRestricted { current: u32 },
+
     /// `waitpid` returned an unexpected status during ptrace flow.
     #[error("unexpected wait status during {op:?} for PID {pid}: {status}")]
     UnexpectedWaitStatus {
@@ -212,6 +223,17 @@ mod tests {
                 },
             ),
             ("UnloadFailed", Error::UnloadFailed("cleanup".into())),
+            (
+                "SandboxedTarget",
+                Error::SandboxedTarget {
+                    pid: 42,
+                    reason: "Flatpak sandbox".into(),
+                },
+            ),
+            (
+                "PtraceScopeRestricted",
+                Error::PtraceScopeRestricted { current: 1 },
+            ),
         ];
         for (name, err) in errors {
             let msg = err.to_string();

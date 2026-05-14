@@ -111,6 +111,88 @@ pub(crate) struct Response {
 }
 
 // ---------------------------------------------------------------------------
+// Preflight checks — fail early with structured errors instead of a
+// generic "permission denied" from ptrace.
+// ---------------------------------------------------------------------------
+
+/// Run sandbox / ptrace-scope checks before attempting injection.
+/// Returns `Ok(())` if the target looks reachable, or a structured error
+/// with remediation text.
+fn preflight(pid: u32) -> Result<(), Error> {
+    // 1. Yama ptrace_scope
+    if let Ok(scope) = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
+        if let Ok(val) = scope.trim().parse::<u32>() {
+            if val != 0 {
+                return Err(Error::PtraceScopeRestricted { current: val });
+            }
+        }
+    }
+
+    // 2. Per-process sandbox indicators via /proc/<pid>/status
+    let status_path = format!("/proc/{pid}/status");
+    if let Ok(status) = std::fs::read_to_string(&status_path) {
+        for line in status.lines() {
+            if line.starts_with("NoNewPrivs:") && line.contains('\t') {
+                let val = line.split('\t').nth(1).unwrap_or("0");
+                if val.trim() == "1" {
+                    return Err(Error::SandboxedTarget {
+                        pid,
+                        reason: "NoNewPrivs is set (systemd RestrictPtrace / seccomp policy)"
+                            .into(),
+                    });
+                }
+            }
+            if line.starts_with("Seccomp:") && line.contains('\t') {
+                let val = line.split('\t').nth(1).unwrap_or("0");
+                if val.trim() != "0" {
+                    return Err(Error::SandboxedTarget {
+                        pid,
+                        reason: format!(
+                            "seccomp filter active (mode {}) — may block ptrace",
+                            val.trim()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // 3. Environment-based sandbox detection (Flatpak, Snap)
+    let environ_path = format!("/proc/{pid}/environ");
+    if let Ok(data) = std::fs::read(&environ_path) {
+        let env = String::from_utf8_lossy(&data);
+        for var in env.split('\0') {
+            if var.starts_with("FLATPAK_ID=") {
+                return Err(Error::SandboxedTarget {
+                    pid,
+                    reason: format!(
+                        "Flatpak sandbox detected ({})",
+                        var.strip_prefix("FLATPAK_ID=").unwrap_or("?")
+                    ),
+                });
+            }
+            if var.starts_with("SNAP=") || var.starts_with("SNAP_NAME=") {
+                return Err(Error::SandboxedTarget {
+                    pid,
+                    reason: "Snap sandbox detected".into(),
+                });
+            }
+            if var.starts_with("container=") {
+                return Err(Error::SandboxedTarget {
+                    pid,
+                    reason: format!(
+                        "container runtime detected ({})",
+                        var.strip_prefix("container=").unwrap_or("?")
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -143,6 +225,9 @@ impl Session {
     /// Returns structured errors for every phase: permission denied, ptrace
     /// failure, socket timeout, protocol mismatch, etc.
     pub async fn new(pid: u32) -> Result<Self, Error> {
+        // Fail early with a structured error if the target is unreachable.
+        preflight(pid)?;
+
         let payload_path = extract_payload().await?;
         let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
         let sock_path_str = sock_path.to_string_lossy().to_string();
