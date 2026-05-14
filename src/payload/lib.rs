@@ -277,6 +277,12 @@ unsafe fn sweep_event_queues() {
         found
     };
 
+    // No input proxies have been captured yet — the target hasn't bound
+    // wl_seat (or equivalent).  Avoid dereferencing null below.
+    if queue.is_null() {
+        return;
+    }
+
     let q = queue as *mut wl_event_queue;
     let head = &(*q).proxy_list as *const wl_list as *mut wl_list;
     let mut cur = (*head).next;
