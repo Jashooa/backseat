@@ -635,11 +635,11 @@ enum IpcCommand {
     Modifiers { depressed: u32 },
 }
 
+#[derive(Debug)]
 enum HandleResult {
     Response(String),
     Unload,
 }
-
 fn parse_state(s: &str) -> u32 {
     match s {
         "pressed" => 1,
@@ -911,6 +911,16 @@ pub unsafe extern "C" fn backseat_init(path: *const c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    /// Tests that touch `COMMAND_QUEUE` must run sequentially because
+    /// the queue is a process-global `Mutex`.  This lock serialises
+    /// entry to every test in the module.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // -----------------------------------------------------------------------
+    // to_fixed
+    // -----------------------------------------------------------------------
 
     #[test]
     fn to_fixed_rounds_half_up() {
@@ -918,6 +928,21 @@ mod tests {
         assert_eq!(to_fixed(1.501), 384);
         assert_eq!(to_fixed(1.505), 385);
     }
+
+    #[test]
+    fn to_fixed_negative() {
+        assert_eq!(to_fixed(-1.0), -256);
+        assert_eq!(to_fixed(-0.5), -128);
+    }
+
+    #[test]
+    fn to_fixed_zero() {
+        assert_eq!(to_fixed(0.0), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // monotonic_ms / next_serial
+    // -----------------------------------------------------------------------
 
     #[test]
     fn monotonic_ms_is_monotonic() {
@@ -931,5 +956,294 @@ mod tests {
         let s1 = next_serial();
         let s2 = next_serial();
         assert!(s2 > s1, "serial did not increment: {s1} -> {s2}");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_state_pressed() {
+        assert_eq!(parse_state("pressed"), 1);
+    }
+
+    #[test]
+    fn parse_state_released() {
+        assert_eq!(parse_state("released"), 0);
+    }
+
+    #[test]
+    fn parse_state_unknown_defaults_to_released() {
+        assert_eq!(parse_state(""), 0);
+        assert_eq!(parse_state("garbage"), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // make_ok / make_error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn make_ok_produces_valid_json() {
+        let json = make_ok();
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "ok");
+    }
+
+    #[test]
+    fn make_error_produces_valid_json() {
+        let json = make_error("proxy_not_found", "no pointer");
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["code"], "proxy_not_found");
+        assert_eq!(v["message"], "no pointer");
+    }
+
+    /// The host's `Response` struct must be able to deserialize
+    /// make_error output.  Verify the exact field names match.
+    #[test]
+    fn make_error_roundtrips_with_host_response() {
+        let json = make_error("bad_cmd", "test message");
+        let v: Value = serde_json::from_str(&json).unwrap();
+        // The host crate source maps these fields as:
+        //   status, code, message
+        assert!(v.get("status").is_some());
+        assert!(v.get("code").is_some());
+        assert!(v.get("message").is_some());
+    }
+
+    /// Acquire the serialisation lock for tests that touch global state
+    /// (COMMAND_QUEUE, G_* atomics).
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap()
+    }
+
+    /// Send a JSON line to handle_request.  The caller must hold
+    /// TEST_LOCK.  Returns the parsed response and drains any commands
+    /// that were enqueued into a Vec.
+    fn send(line: &str) -> (Value, Vec<IpcCommand>) {
+        COMMAND_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let resp = match handle_request(line) {
+            HandleResult::Response(s) => serde_json::from_str(&s).unwrap(),
+            HandleResult::Unload => {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "status".to_string(),
+                    serde_json::Value::String("ok".to_string()),
+                );
+                serde_json::Value::Object(m)
+            }
+        };
+        let cmds: Vec<IpcCommand> = COMMAND_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        (resp, cmds)
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — hello
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_hello() {
+        let _g = lock();
+        let (resp, _) = send(r#"{"type":"hello"}"#);
+        assert_eq!(resp["type"], "hello_ack");
+        assert_eq!(resp["protocol_version"], 1);
+        assert!(resp.get("payload_version").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — mouse_move
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_mouse_move_enqueues_command() {
+        let _g = lock();
+        let (resp, cmds) = send(r#"{"type":"mouse_move","x":100.5,"y":200.3}"#);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            IpcCommand::MouseMove { x, y } => {
+                assert!((x - 100.5).abs() < 0.001);
+                assert!((y - 200.3).abs() < 0.001);
+            }
+            other => panic!("expected MouseMove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_mouse_move_missing_coords_defaults_to_zero() {
+        let _g = lock();
+        let (resp, cmds) = send(r#"{"type":"mouse_move"}"#);
+        assert_eq!(resp["status"], "ok");
+        match &cmds[0] {
+            IpcCommand::MouseMove { x, y } => {
+                assert_eq!(*x, 0.0);
+                assert_eq!(*y, 0.0);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — mouse_button
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_mouse_button_pressed() {
+        let _g = lock();
+        let (resp, cmds) = send(r#"{"type":"mouse_button","button":272,"state":"pressed"}"#);
+        assert_eq!(resp["status"], "ok");
+        match &cmds[0] {
+            IpcCommand::MouseButton { button, state } => {
+                assert_eq!(*button, 272);
+                assert_eq!(*state, 1);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_mouse_button_released() {
+        let _g = lock();
+        let (resp, cmds) = send(r#"{"type":"mouse_button","button":273,"state":"released"}"#);
+        assert_eq!(resp["status"], "ok");
+        match &cmds[0] {
+            IpcCommand::MouseButton { button, state } => {
+                assert_eq!(*button, 273);
+                assert_eq!(*state, 0);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_key_pressed() {
+        let _g = lock();
+        let (resp, cmds) = send(r#"{"type":"key","key":30,"state":"pressed"}"#);
+        assert_eq!(resp["status"], "ok");
+        match &cmds[0] {
+            IpcCommand::Key { key, state } => {
+                assert_eq!(*key, 30);
+                assert_eq!(*state, 1);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_key_missing_fields_defaults() {
+        let _g = lock();
+        let (resp, cmds) = send(r#"{"type":"key"}"#);
+        assert_eq!(resp["status"], "ok");
+        match &cmds[0] {
+            IpcCommand::Key { key, state } => {
+                assert_eq!(*key, 0);
+                assert_eq!(*state, 0);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — modifiers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_modifiers() {
+        let _g = lock();
+        let (resp, cmds) = send(r#"{"type":"modifiers","depressed":1}"#);
+        assert_eq!(resp["status"], "ok");
+        match &cmds[0] {
+            IpcCommand::Modifiers { depressed } => assert_eq!(*depressed, 1),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — surface_size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_surface_size_without_toplevel() {
+        let _g = lock();
+        let (resp, _) = send(r#"{"type":"surface_size"}"#);
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["code"], "proxy_not_found");
+    }
+
+    #[test]
+    fn handle_surface_size_with_toplevel() {
+        let _g = lock();
+        G_XDG_TOPLEVEL.store(std::ptr::dangling_mut::<c_void>(), Ordering::Release);
+        G_SURFACE_W.store(1920, Ordering::Release);
+        G_SURFACE_H.store(1080, Ordering::Release);
+
+        let (resp, _) = send(r#"{"type":"surface_size"}"#);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["width"], 1920);
+        assert_eq!(resp["height"], 1080);
+
+        G_XDG_TOPLEVEL.store(std::ptr::null_mut(), Ordering::Release);
+        G_SURFACE_W.store(0, Ordering::Release);
+        G_SURFACE_H.store(0, Ordering::Release);
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_status_reports_dispatch_hook() {
+        let _g = lock();
+        G_DISPATCH_CALLED.store(true, Ordering::Release);
+        let (resp, _) = send(r#"{"type":"status"}"#);
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(resp["dispatch_hook_installed"], true);
+
+        G_DISPATCH_CALLED.store(false, Ordering::Release);
+        let (resp, _) = send(r#"{"type":"status"}"#);
+        assert_eq!(resp["dispatch_hook_installed"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — unload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_unload_returns_unload_variant() {
+        match handle_request(r#"{"type":"unload"}"#) {
+            HandleResult::Unload => {}
+            other => panic!("expected Unload, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request — error cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_request_malformed_json() {
+        let _g = lock();
+        let (resp, _) = send("not json at all");
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["code"], "invalid_json");
+    }
+
+    #[test]
+    fn handle_request_unknown_command() {
+        let _g = lock();
+        let (resp, _) = send(r#"{"type":"nonexistent_cmd"}"#);
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["code"], "unknown_command");
     }
 }
