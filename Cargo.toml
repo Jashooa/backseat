@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/backseat", "crates/backseat-payload", "crates/backseat-test-fixture"]
+exclude = ["crates/backseat/payload"]
 resolver = "2"
 
 [workspace.package]
