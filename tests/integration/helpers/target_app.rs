@@ -117,9 +117,9 @@ impl TargetApp {
 impl Drop for TargetApp {
     fn drop(&mut self) {
         // Try SIGTERM first, then SIGKILL after a short timeout.
-        if self.child.kill().is_err() {
-            return;
-        }
+        // Always try_wait/wait regardless of kill() outcome so we
+        // don't leak zombie processes.
+        let _ = self.child.kill();
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
             if let Ok(Some(_)) = self.child.try_wait() {

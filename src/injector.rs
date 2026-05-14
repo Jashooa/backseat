@@ -431,9 +431,9 @@ fn make_shellcode(
     // movabs rdi, payload_path_addr
     code.extend_from_slice(&[0x48, 0xBF]);
     code.extend_from_slice(&payload_path_addr.to_le_bytes());
-    // movabs rsi, RTLD_NOW
+    // movabs rsi, RTLD_NOW | RTLD_GLOBAL
     code.extend_from_slice(&[0x48, 0xBE]);
-    code.extend_from_slice(&(libc::RTLD_NOW as u64).to_le_bytes());
+    code.extend_from_slice(&((libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64).to_le_bytes());
     // movabs rax, dlopen_addr
     code.extend_from_slice(&[0x48, 0xB8]);
     code.extend_from_slice(&dlopen_addr.to_le_bytes());
@@ -497,9 +497,9 @@ mod tests {
         // movabs rdi, payload_path_addr
         expected.extend_from_slice(&[0x48, 0xBF]);
         expected.extend_from_slice(&0x2021_2223_2425_2627u64.to_le_bytes());
-        // movabs rsi, RTLD_NOW (2)
+        // movabs rsi, RTLD_NOW | RTLD_GLOBAL (0x102)
         expected.extend_from_slice(&[0x48, 0xBE]);
-        expected.extend_from_slice(&2u64.to_le_bytes());
+        expected.extend_from_slice(&((libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64).to_le_bytes());
         // movabs rax, dlopen_addr
         expected.extend_from_slice(&[0x48, 0xB8]);
         expected.extend_from_slice(&0x0000_0001_0203_0405u64.to_le_bytes());
@@ -537,25 +537,24 @@ mod tests {
         // RTLD_NOW immediate is at bytes 12–19 (movabs rsi follows
         // movabs rdi + 8-byte immediate at bytes 0–9).
         let rsi_imm: [u8; 8] = sc[12..20].try_into().unwrap();
-        assert_eq!(u64::from_le_bytes(rsi_imm), 2, "RTLD_NOW constant is wrong");
+        assert_eq!(
+            u64::from_le_bytes(rsi_imm),
+            (libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64,
+            "RTLD flags embedded in shellcode are wrong"
+        );
     }
 
-    /// The RTLD_NOW constant must be exactly 2 (RTLD_NOW=2 on Linux).
+    /// The RTLD flags embedded in the shellcode must match libc.
     #[test]
-    fn shellcode_rtld_now_constant() {
+    fn shellcode_rtld_flags_constant() {
         let sc = make_shellcode(1, 2, 3, 4, 5);
-        // Bytes 12–19: the movabs rsi immediate.
+        // Bytes 12–19: the movabs rsi immediate (dlopen flags).
         let imm: [u8; 8] = sc[12..20].try_into().unwrap();
         let val = u64::from_le_bytes(imm);
+        let expected = (libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64;
         assert_eq!(
-            val,
-            libc::RTLD_NOW as u64,
-            "RTLD_NOW constant embedded in shellcode doesn't match libc::RTLD_NOW"
-        );
-        assert_eq!(
-            libc::RTLD_NOW,
-            2,
-            "RTLD_NOW changed — update shellcode test"
+            val, expected,
+            "RTLD flags embedded in shellcode don't match libc"
         );
     }
 

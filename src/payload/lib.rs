@@ -104,12 +104,12 @@ struct wl_display_header {
     proxy: wl_proxy,
     connection: *mut c_void,
     last_error: c_int,
-    _pad1: u32,
-    _protocol_error_code: u32,
-    _pad2: u32,
-    _protocol_error_interface: *const c_void,
-    _protocol_error_id: u32,
-    _pad3: u32,
+    /// Opaque blob covering the anonymous `protocol_error` substruct.
+    /// The C layout is `{ uint32_t code; const wl_interface *interface;
+    /// uint32_t id; }` with inter-field padding.  Using an opaque blob
+    /// avoids mirroring the exact field order, which is easy to get
+    /// wrong and harmless since we only access `objects` below.
+    _protocol_error: [u8; 28],
     fd: c_int,
     _pad4: u32,
     objects: wl_map,
