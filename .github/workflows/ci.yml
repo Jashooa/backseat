@@ -37,5 +37,7 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y weston libwayland-dev
       - name: Enable ptrace
         run: sudo sysctl kernel.yama.ptrace_scope=0
+      - name: Build test fixture
+        run: cargo build -p backseat-test-fixture
       - name: Run workspace tests
         run: cargo test --workspace

@@ -198,8 +198,9 @@ Integration tests require `weston` (headless compositor) and
 `ptrace_scope = 0`:
 
 ```bash
-sudo apt-get install weston
+sudo apt-get install weston libwayland-dev
 echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+cargo build -p backseat-test-fixture
 cargo test --workspace
 ```
 
