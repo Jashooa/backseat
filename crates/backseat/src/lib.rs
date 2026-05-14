@@ -28,11 +28,8 @@
 //!
 //! # Architecture
 //!
-//! The crate is a Cargo workspace containing two crates:
-//!
-//! - `backseat-payload` — a `cdylib` that is injected into the target.
-//! - `backseat` — the published API crate that embeds the payload at
-//!   compile time and handles ptrace injection / IPC.
+//! The crate builds an injected shared library (the "payload") from vendored
+//! source at compile time and handles ptrace injection / IPC.
 
 pub mod error;
 pub mod keys;

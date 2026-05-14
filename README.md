@@ -139,13 +139,9 @@ match Session::from_name("myapp").await {
 
 The crate is a Cargo workspace with two crates:
 
-- **`backseat-payload`** — a `cdylib` that is injected into the target process.
-  It patches GOT entries to intercept `wl_display_dispatch*` functions, captures
-  Wayland proxies from the C library's `wl_map`, and dispatches synthetic input
-  on the application's own event thread.
-- **`backseat`** — the published API crate. It embeds the payload at compile
-  time, performs ptrace injection, and handles IPC over a per-process Unix
-  socket.
+- **`backseat`** — the published API crate. It builds an injected shared
+  library (the "payload") from vendored source at compile time, performs
+  ptrace injection, and handles IPC over a per-process Unix socket.
 
 ## Security
 
