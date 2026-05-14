@@ -377,8 +377,9 @@ async fn extract_payload() -> Result<PathBuf, Error> {
         let path = dir.join(format!("backseat-payload-{}.so", prefix));
 
         // Atomic create with O_CREAT | O_EXCL | O_NOFOLLOW and mode 0600.
-        // If the file already exists (legitimately from a previous run),
-        // treat AlreadyExists as success.
+        // If the file already exists, verify its contents and ownership
+        // before using it — a file placed by another local user at the
+        // predictable path could otherwise be injected.
         let mut file = match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -388,7 +389,57 @@ async fn extract_payload() -> Result<PathBuf, Error> {
         {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Ok(path);
+                // Verify ownership and permissions.
+                let meta = match std::fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return Err(Error::PayloadExtractFailed(format!(
+                            "stat existing payload: {e}"
+                        )));
+                    }
+                };
+                use std::os::unix::fs::MetadataExt;
+                if meta.uid() != unsafe { libc::geteuid() } {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(Error::PayloadExtractFailed(
+                        "existing payload owned by different user".into(),
+                    ));
+                }
+                if meta.mode() & 0o077 != 0 {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(Error::PayloadExtractFailed(
+                        "existing payload has unsafe permissions".into(),
+                    ));
+                }
+                // Hash-verify the existing file.
+                let existing = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Err(Error::PayloadExtractFailed(format!(
+                            "read existing payload: {e}"
+                        )));
+                    }
+                };
+                let existing_hash = sha2::Sha256::digest(&existing);
+                if existing_hash.as_slice() == hash.as_slice() {
+                    return Ok(path);
+                }
+                // Hash mismatch — replace with the correct payload.
+                let _ = std::fs::remove_file(&path);
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return Err(Error::PayloadExtractFailed(format!(
+                            "recreate payload: {e}"
+                        )));
+                    }
+                }
             }
             Err(e) => {
                 return Err(Error::PayloadExtractFailed(format!("open payload: {e}")));

@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::io::{BufRead, Write};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
@@ -115,6 +116,7 @@ static G_SURFACE_H: AtomicU32 = AtomicU32::new(0);
 static G_DISPLAY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static G_DISPATCH_CALLED: AtomicBool = AtomicBool::new(false);
 static G_INITIAL_SWEEP_DONE: AtomicBool = AtomicBool::new(false);
+static G_HOST_PID: AtomicU32 = AtomicU32::new(0);
 static COMMAND_QUEUE: Mutex<VecDeque<IpcCommand>> = Mutex::new(VecDeque::new());
 static IPC_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -864,6 +866,19 @@ fn ipc_thread() {
         libc::chmod(sock_path_cstring.as_ptr(), 0o700);
     }
 
+    // Enable SO_PASSCRED so we can verify the connecting peer's PID.
+    // This prevents other same-UID processes from driving the target.
+    unsafe {
+        let one: libc::c_int = 1;
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
     let (stream, _) = match listener.accept() {
         Ok(v) => v,
         Err(_) => {
@@ -871,6 +886,26 @@ fn ipc_thread() {
             return;
         }
     };
+
+    // Verify the connecting peer's PID matches the host process.
+    let host_pid = G_HOST_PID.load(Ordering::Acquire);
+    if host_pid != 0 {
+        let mut cred: libc::ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut cred_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut cred_len,
+            )
+        };
+        if ret != 0 || cred.pid != host_pid as libc::pid_t {
+            IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
 
     let mut write_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -954,6 +989,10 @@ pub unsafe extern "C" fn backseat_init(path: *const c_char) {
             std::ptr::addr_of_mut!(BACKSEAT_SOCK_PATH).cast::<u8>(),
             len,
         );
+        // The host PID is written immediately after the socket path's
+        // null terminator in the target's memory (see injector.rs).
+        let host_pid_ptr = path.add(bytes.len()).cast::<u32>();
+        G_HOST_PID.store(host_pid_ptr.read_unaligned(), Ordering::SeqCst);
     }
 
     extern "C" fn ipc_thread_wrapper(_arg: *mut c_void) -> *mut c_void {

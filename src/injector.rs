@@ -117,9 +117,13 @@ pub fn inject_payload(pid: u32, payload_path: &Path, socket_path: &str) -> Resul
 
     let symbol_name = b"backseat_init\0";
 
+    let host_pid = std::process::id();
+    let host_pid_bytes: [u8; 4] = host_pid.to_ne_bytes();
+
     let payload_addr = scratch;
     let socket_addr = payload_addr + ((payload_bytes.len() + 7) & !7) as u64;
-    let symbol_addr = socket_addr + ((socket_bytes.len() + 7) & !7) as u64;
+    let host_pid_addr = socket_addr + socket_bytes.len() as u64;
+    let symbol_addr = (host_pid_addr + std::mem::size_of::<u32>() as u64 + 7) & !7;
     let code_addr = symbol_addr + ((symbol_name.len() + 7) & !7) as u64;
 
     let shellcode = make_shellcode(
@@ -137,6 +141,9 @@ pub fn inject_payload(pid: u32, payload_path: &Path, socket_path: &str) -> Resul
     let orig_socket = tracee
         .read_memory(socket_addr, socket_bytes.len())
         .map_err(|e| Error::PayloadExtractFailed(format!("read socket bytes: {e}")))?;
+    let orig_host_pid = tracee
+        .read_memory(host_pid_addr, std::mem::size_of::<u32>())
+        .map_err(|e| Error::PayloadExtractFailed(format!("read host pid bytes: {e}")))?;
     let orig_symbol = tracee
         .read_memory(symbol_addr, symbol_name.len())
         .map_err(|e| Error::PayloadExtractFailed(format!("read symbol bytes: {e}")))?;
@@ -150,6 +157,9 @@ pub fn inject_payload(pid: u32, payload_path: &Path, socket_path: &str) -> Resul
     tracee
         .write_memory(socket_addr, socket_bytes)
         .map_err(|e| Error::PayloadExtractFailed(format!("write socket bytes: {e}")))?;
+    tracee
+        .write_memory(host_pid_addr, &host_pid_bytes)
+        .map_err(|e| Error::PayloadExtractFailed(format!("write host pid: {e}")))?;
     tracee
         .write_memory(symbol_addr, symbol_name)
         .map_err(|e| Error::PayloadExtractFailed(format!("write symbol bytes: {e}")))?;
@@ -243,6 +253,9 @@ pub fn inject_payload(pid: u32, payload_path: &Path, socket_path: &str) -> Resul
     tracee
         .write_memory(socket_addr, &orig_socket)
         .map_err(|e| Error::PayloadExtractFailed(format!("restore socket bytes: {e}")))?;
+    tracee
+        .write_memory(host_pid_addr, &orig_host_pid)
+        .map_err(|e| Error::PayloadExtractFailed(format!("restore host pid bytes: {e}")))?;
     tracee
         .write_memory(symbol_addr, &orig_symbol)
         .map_err(|e| Error::PayloadExtractFailed(format!("restore symbol bytes: {e}")))?;
