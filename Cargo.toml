@@ -11,3 +11,4 @@ rust-version = "1.93"
 
 [profile.release]
 lto = true
+panic = "abort"

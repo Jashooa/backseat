@@ -8,6 +8,26 @@ events. Because the events are delivered inside the target's own
 `wl_display_dispatch` call, the compositor never sees them — the application
 treats them as genuine input.
 
+## Why
+
+Wayland has no equivalent of X11's `XTest` extension — there is no global,
+unprivileged API for injecting input across arbitrary applications. The
+`virtual-keyboard-unstable-v1` and `wlr-virtual-pointer-unstable-v1` protocols
+exist, but they require the compositor to implement them and to trust the
+calling client.  You can't `xdotool click 1` on Wayland.
+
+`backseat` solves this from the other direction.  Instead of asking the
+compositor for permission, it injects a payload directly into the target
+application's process.  The payload hooks the app's own Wayland event loop and
+synthesises input events that are indistinguishable from real hardware input.
+The compositor never knows the difference.
+
+This makes `backseat` useful for:
+
+- **Test automation** — drive Wayland-native apps without instrumenting them
+- **Accessibility tooling** — emulate keyboard and mouse for users who need it
+- **Scripting / macros** — automate repetitive interactions in any Wayland app
+
 [![CI](https://github.com/Jashooa/backseat/actions/workflows/ci.yml/badge.svg)](https://github.com/Jashooa/backseat/actions/workflows/ci.yml)
 
 ## Quick start
@@ -120,8 +140,9 @@ match Session::from_name("myapp").await {
 The crate is a Cargo workspace with two crates:
 
 - **`backseat-payload`** — a `cdylib` that is injected into the target process.
-  It shadows libwayland-client PLT entries to capture Wayland proxies and
-  dispatches synthetic input on the application's own event thread.
+  It patches GOT entries to intercept `wl_display_dispatch*` functions, captures
+  Wayland proxies from the C library's `wl_map`, and dispatches synthetic input
+  on the application's own event thread.
 - **`backseat`** — the published API crate. It embeds the payload at compile
   time, performs ptrace injection, and handles IPC over a per-process Unix
   socket.
@@ -147,9 +168,12 @@ and no attempt is made to conceal the injection.
   another thread is inside `dlopen`/`dlsym` at the moment of injection.
 - PID reuse is possible (but unlikely) between `Session::from_name` resolution
   and `ptrace::attach`.  Use `Session::new(pid)` when stability is critical.
-- Dispatcher-style proxies (`wl_proxy_add_dispatcher`, used by `wayland-rs`,
-  winit, iced, COSMIC, etc.) are not yet supported.  Synthetic events will
-  silently fail for these clients until dispatcher support is implemented.
+- Dispatcher-style proxies (`wl_proxy_add_dispatcher`, used by `wayland-rs`
+  v0.31+, winit, iced, COSMIC, etc.) are not yet supported.  The payload's
+  `initial_sweep` cannot find dispatcher proxies in the C library's `wl_map`,
+  so `surface_size()`, `G_POINTER`, and `G_KEYBOARD` remain unset.  Synthetic
+  events silently fail for these clients.  Use `wl_proxy_add_listener`-based
+  clients (raw libwayland, `wayland-rs` v0.30, GTK3) for full functionality.
 
 ## Development
 
@@ -163,10 +187,22 @@ make all
 # Individual steps
 make fmt          # apply formatting
 make clippy       # lint with clippy
-make test         # unit + doc tests (integration tests are skipped)
-make integration  # run integration tests (requires Wayland + ptrace)
+make test         # unit + doc tests
 make test-all     # test entire workspace
+make integration  # integration tests (requires Wayland + ptrace)
 ```
+
+Integration tests require `weston` (headless compositor) and
+`ptrace_scope = 0`:
+
+```bash
+sudo apt-get install weston
+echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+cargo test -p backseat --test integration -- --ignored --test-threads=1
+```
+
+Each test starts its own headless compositor and fixture, so no state
+leaks between tests.
 
 ## License
 

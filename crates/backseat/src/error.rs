@@ -76,8 +76,12 @@ pub enum Error {
     UnloadFailed(String),
 
     /// `waitpid` returned an unexpected status during ptrace flow.
-    #[error("unexpected wait status during {op:?} for PID {pid}")]
-    UnexpectedWaitStatus { pid: u32, op: PtraceOp },
+    #[error("unexpected wait status during {op:?} for PID {pid}: {status}")]
+    UnexpectedWaitStatus {
+        pid: u32,
+        op: PtraceOp,
+        status: String,
+    },
 }
 
 /// Ptrace operations that can fail.
@@ -188,8 +192,10 @@ mod tests {
         let e = Error::UnexpectedWaitStatus {
             pid: 1234,
             op: PtraceOp::Attach,
+            status: "Stopped(Pid(1234), SIGUSR1)".to_string(),
         };
         assert!(e.to_string().contains("Attach"));
         assert!(e.to_string().contains("1234"));
+        assert!(e.to_string().contains("SIGUSR1"));
     }
 }

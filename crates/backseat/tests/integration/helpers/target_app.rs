@@ -84,6 +84,7 @@ impl TargetApp {
     ///
     /// # Panics
     /// Panics if the timeout expires or the fixture exits.
+    #[allow(dead_code)]
     pub fn next_event(&mut self, timeout: Duration) -> String {
         let deadline = std::time::Instant::now() + timeout;
 
@@ -104,6 +105,7 @@ impl TargetApp {
     }
 
     /// Send SIGUSR1 to trigger a reset and wait for `EVENT: ready`.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         unsafe {
             libc::kill(self.pid() as i32, libc::SIGUSR1);

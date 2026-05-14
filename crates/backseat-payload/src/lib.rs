@@ -3,45 +3,31 @@
 //! This crate is compiled as a `cdylib` and injected into a target process via
 //! `dlopen`. Once loaded, it:
 //!
-//! 1. Spawns an IPC thread listening on a per-PID Unix socket.
-//! 2. Shadows libwayland-client PLT entries (`wl_display_dispatch`,
-//!    `wl_registry_bind`, `wl_seat_get_pointer`, etc.) to capture Wayland
-//!    proxies as they are created.
-//! 3. Walks libwayland's internal proxy table once to capture proxies that
-//!    already exist at injection time.
+//! 1. Patches the GOT entries of the target executable (and all loaded
+//!    libraries) for `wl_display_dispatch*` functions to point to our hooks.
+//! 2. Scans libwayland's internal proxy table to capture existing proxies.
+//! 3. Spawns an IPC thread listening on a per-PID Unix socket.
 //! 4. Queues synthetic input commands received over the IPC socket and
-//!    dispatches them inside the app's natural `wl_display_dispatch` calls,
-//!    ensuring the compositor never sees the events.
-//!
-//! # Safety
-//!
-//! This crate makes heavy use of `unsafe` because it must:
-//!
-//! - Interact with raw C pointers and libwayland internal data structures.
-//! - Use `dlsym(RTLD_NEXT, ...)` to call the real libwayland functions.
-//! - Transmute function pointers to match Wayland listener signatures.
-//! - Walk internal libwayland structs whose layout is assumed ABI-stable.
+//!    dispatches them inside the app's natural dispatch calls.
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // libwayland internal structures (ABI-stable across libwayland 1.x)
 // ---------------------------------------------------------------------------
 
-/// Doubly-linked list used throughout libwayland.
 #[repr(C)]
 struct wl_list {
     prev: *mut wl_list,
     next: *mut wl_list,
 }
 
-/// Growable array used by libwayland for proxy tables and other collections.
 #[repr(C)]
 struct wl_array {
     size: usize,
@@ -49,10 +35,6 @@ struct wl_array {
     data: *mut c_void,
 }
 
-/// Describes a Wayland interface (name, version, method/event counts).
-///
-/// Every proxy has a pointer to its interface, which lets us identify the
-/// protocol object type (e.g. `"wl_seat"`, `"wl_pointer"`, etc.).
 #[repr(C)]
 pub struct wl_interface {
     name: *const c_char,
@@ -63,8 +45,6 @@ pub struct wl_interface {
     events: *const c_void,
 }
 
-/// Base object inside every `wl_proxy`. Contains the interface, implementation
-/// (listener struct pointer), and object ID.
 #[repr(C)]
 struct wl_object {
     interface: *const wl_interface,
@@ -73,9 +53,6 @@ struct wl_object {
     _pad: u32,
 }
 
-/// libwayland client proxy. The `implementation` field (via `wl_object`) points
-/// to the application's listener function table, which we invoke directly to
-/// inject synthetic events.
 #[repr(C)]
 struct wl_proxy {
     object: wl_object,
@@ -87,100 +64,75 @@ struct wl_proxy {
     dispatcher: *mut c_void,
     version: u32,
     _pad: u32,
+    tag: *const *const c_char,
+    queue_link: wl_list,
 }
 
-/// libwayland event queue. Part of `wl_display` layout calculation.
 #[repr(C)]
 struct wl_event_queue {
     event_list: wl_list,
+    proxy_list: wl_list,
     display: *mut c_void,
-    link: wl_list,
     name: *mut c_char,
 }
 
-/// libwayland ID-to-proxy map. `client_entries` is an array of `wl_proxy *`
-/// indexed by Wayland object ID.
 #[repr(C)]
 struct wl_map {
     client_entries: wl_array,
     server_entries: wl_array,
-    free_list: u32,
     side: u32,
+    free_list: u32,
 }
 
-/// Partial definition of `struct wl_display` up to the `objects` field.
-///
-/// We only need the offset of `objects` (168 bytes on x86-64) so we can walk
-/// the proxy table and capture existing proxies at injection time.
 #[repr(C)]
 struct wl_display_header {
     proxy: wl_proxy,
-    display_queue: wl_event_queue,
-    default_queue: wl_event_queue,
+    connection: *mut c_void,
+    last_error: c_int,
+    _pad1: u32,
+    _protocol_error_code: u32,
+    _pad2: u32,
+    _protocol_error_interface: *const c_void,
+    _protocol_error_id: u32,
+    _pad3: u32,
+    fd: c_int,
+    _pad4: u32,
     objects: wl_map,
+    display_queue: wl_event_queue,
+    // default_queue follows but we don't need it
 }
 
 // ---------------------------------------------------------------------------
 // Globals
 // ---------------------------------------------------------------------------
 
-/// Captured `wl_pointer` proxy (or `NULL` if not yet seen).
 static G_POINTER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Captured `wl_keyboard` proxy (or `NULL` if not yet seen).
 static G_KEYBOARD: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Captured `wl_seat` proxy (or `NULL` if not yet seen).
 static G_SEAT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Captured `xdg_toplevel` proxy for surface size tracking.
 static G_XDG_TOPLEVEL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Most recent configured surface width (pixels).
 static G_SURFACE_W: AtomicU32 = AtomicU32::new(0);
-
-/// Most recent configured surface height (pixels).
 static G_SURFACE_H: AtomicU32 = AtomicU32::new(0);
-
-/// First `wl_display *` seen by the dispatch hook.
 static G_DISPLAY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Set to `true` the first time `wl_display_dispatch` (or `_pending`) is
-/// called, so the host can detect whether the dispatch hook is active.
 static G_DISPATCH_CALLED: AtomicBool = AtomicBool::new(false);
-
-/// Set to `true` after the one-time initial proxy sweep.
 static G_INITIAL_SWEEP_DONE: AtomicBool = AtomicBool::new(false);
-
-/// Commands received from the host that have not yet been dispatched on the
-/// app's event thread.
 static COMMAND_QUEUE: Mutex<VecDeque<IpcCommand>> = Mutex::new(VecDeque::new());
-
-/// Prevents the IPC thread from being spawned more than once (e.g. if the
-/// payload is accidentally loaded twice).
 static IPC_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+
+// Stored real function pointers (saved before GOT patching).
+static REAL_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+static REAL_DISPATCH_PENDING: AtomicUsize = AtomicUsize::new(0);
+static REAL_DISPATCH_QUEUE: AtomicUsize = AtomicUsize::new(0);
+static REAL_DISPATCH_QUEUE_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-toplevel saved listener state: `(toplevel_addr, orig_func, orig_data)`.
+static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+
+unsafe impl Send for wl_proxy {}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Look up the *real* libwayland symbol via `dlsym(RTLD_NEXT, …)`.
-///
-/// # Safety
-/// `name` must be a valid C string.
-unsafe fn get_real(name: &CStr) -> Option<*mut c_void> {
-    let ptr = libc::dlsym(libc::RTLD_NEXT, name.as_ptr());
-    if ptr.is_null() {
-        None
-    } else {
-        Some(ptr)
-    }
-}
-
-/// Return the interface name of a `wl_proxy` (e.g. `b"wl_seat"`).
-///
-/// # Safety
-/// `proxy` must be a valid `wl_proxy *`.
 unsafe fn proxy_interface_name(proxy: *mut c_void) -> Option<&'static [u8]> {
     let p = proxy as *mut wl_proxy;
     let iface = (*p).object.interface;
@@ -194,19 +146,107 @@ unsafe fn proxy_interface_name(proxy: *mut c_void) -> Option<&'static [u8]> {
     Some(CStr::from_ptr(name).to_bytes())
 }
 
+fn store_real(symbol: &str, ptr: *mut c_void) {
+    let target = match symbol {
+        "wl_display_dispatch" => &REAL_DISPATCH,
+        "wl_display_dispatch_pending" => &REAL_DISPATCH_PENDING,
+        "wl_display_dispatch_queue" => &REAL_DISPATCH_QUEUE,
+        "wl_display_dispatch_queue_pending" => &REAL_DISPATCH_QUEUE_PENDING,
+        _ => return,
+    };
+    target.store(ptr as usize, Ordering::SeqCst);
+}
+
 // ---------------------------------------------------------------------------
-// PLT-shadow hooks
+// Proxy capture
 // ---------------------------------------------------------------------------
 
-/// Common work executed inside every dispatch hook.
-///
-/// 1. Records the display pointer.
-/// 2. Marks that the hook has been called.
-/// 3. Performs a one-time initial sweep of existing proxies.
-/// 4. Drains any queued synthetic input commands and dispatches them.
-///
-/// # Safety
-/// `display` must be a valid `wl_display *`.
+unsafe fn capture_proxy(proxy: *mut c_void) {
+    if let Some(name) = proxy_interface_name(proxy) {
+        match name {
+            b"wl_seat" => G_SEAT.store(proxy, Ordering::Release),
+            b"wl_pointer" => G_POINTER.store(proxy, Ordering::Release),
+            b"wl_keyboard" => G_KEYBOARD.store(proxy, Ordering::Release),
+            b"xdg_toplevel" => {
+                G_XDG_TOPLEVEL.store(proxy, Ordering::Release);
+                install_toplevel_shim(proxy);
+            }
+            _ => {}
+        }
+    }
+}
+
+unsafe fn install_toplevel_shim(toplevel: *mut c_void) {
+    let proxy = toplevel as *mut wl_proxy;
+    let impl_ptr = (*proxy).object.implementation as *mut usize;
+    if impl_ptr.is_null() {
+        return;
+    }
+    // Skip if the implementation pointer is not 8-byte aligned — this
+    // indicates a dispatcher-managed proxy (not a listener array).
+    if (impl_ptr as usize) & 7 != 0 {
+        return;
+    }
+    let func = *impl_ptr;
+    // Skip if the "function pointer" at impl_ptr[0] doesn't look like
+    // a code pointer (dispatcher proxies store a single function here,
+    // not a listener table with user-data at +1).
+    if func == 0 {
+        return;
+    }
+    let data = *impl_ptr.add(1);
+
+    let mut listeners = TOPLEVEL_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = toplevel as usize;
+    if listeners.iter().any(|(k, _, _)| *k == key) {
+        return;
+    }
+    listeners.push((key, func, data));
+
+    *impl_ptr = toplevel_configure_shim as *const () as usize;
+    *impl_ptr.add(1) = data;
+}
+
+extern "C" fn toplevel_configure_shim(
+    _data: *mut c_void,
+    toplevel: *mut c_void,
+    width: i32,
+    height: i32,
+    states: *mut c_void,
+) {
+    G_SURFACE_W.store(width as u32, Ordering::Release);
+    G_SURFACE_H.store(height as u32, Ordering::Release);
+
+    let key = toplevel as usize;
+    let listeners = TOPLEVEL_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, orig_func, orig_data)) = listeners.iter().find(|(k, _, _)| *k == key) {
+        let func: extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void) =
+            unsafe { std::mem::transmute(*orig_func) };
+        func(*orig_data as *mut c_void, toplevel, width, height, states);
+    }
+}
+
+unsafe fn initial_sweep(display: *mut c_void) {
+    let d = display as *mut wl_display_header;
+    let map = &(*d).objects;
+    let entries = map.client_entries.data as *const *mut c_void;
+    let count = map.client_entries.size / std::mem::size_of::<*mut c_void>();
+
+    if entries.is_null() || count == 0 {
+        return;
+    }
+    let slice = std::slice::from_raw_parts(entries, count);
+    for &proxy_ptr in slice.iter() {
+        if !proxy_ptr.is_null() {
+            capture_proxy(proxy_ptr);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run hooks (called from every patched dispatch function)
+// ---------------------------------------------------------------------------
+
 unsafe fn run_hooks(display: *mut c_void) {
     G_DISPLAY.store(display, Ordering::Release);
     G_DISPATCH_CALLED.store(true, Ordering::Release);
@@ -215,7 +255,6 @@ unsafe fn run_hooks(display: *mut c_void) {
         initial_sweep(display);
     }
 
-    // Drain queued async commands.
     let cmds = {
         let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *q)
@@ -225,382 +264,351 @@ unsafe fn run_hooks(display: *mut c_void) {
     }
 }
 
-/// Shadow for `wl_display_dispatch`. Runs hooks, then forwards to the real
-/// libwayland function.
-///
-/// # Safety
-/// `display` must be a valid `wl_display *`.
-#[no_mangle]
-pub unsafe extern "C" fn wl_display_dispatch(display: *mut c_void) -> c_int {
-    run_hooks(display);
-    let real = get_real(c"wl_display_dispatch");
-    match real {
-        Some(f) => {
-            std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void) -> c_int>(f)(display)
-        }
-        None => -1,
-    }
-}
-
-/// Shadow for `wl_display_dispatch_pending`. Identical behaviour to
-/// `wl_display_dispatch`.
-///
-/// # Safety
-/// `display` must be a valid `wl_display *`.
-#[no_mangle]
-pub unsafe extern "C" fn wl_display_dispatch_pending(display: *mut c_void) -> c_int {
-    run_hooks(display);
-    let real = get_real(c"wl_display_dispatch_pending");
-    match real {
-        Some(f) => {
-            std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void) -> c_int>(f)(display)
-        }
-        None => -1,
-    }
-}
-
-/// Shadow for `wl_registry_bind`. Intercepts `wl_seat` bindings so we can
-/// capture the seat proxy immediately.
-///
-/// # Safety
-/// `registry` and `interface` must be valid pointers.
-#[no_mangle]
-pub unsafe extern "C" fn wl_registry_bind(
-    registry: *mut c_void,
-    name: u32,
-    interface: *const wl_interface,
-    version: u32,
-) -> *mut c_void {
-    let real = get_real(c"wl_registry_bind");
-    let proxy = match real {
-        Some(f) => {
-            let func = std::mem::transmute::<
-                *mut c_void,
-                extern "C" fn(*mut c_void, u32, *const wl_interface, u32) -> *mut c_void,
-            >(f);
-            func(registry, name, interface, version)
-        }
-        None => std::ptr::null_mut(),
-    };
-
-    if !proxy.is_null() && !interface.is_null() {
-        let iface_name = CStr::from_ptr((*interface).name).to_bytes();
-        if iface_name == b"wl_seat" {
-            G_SEAT.store(proxy, Ordering::Release);
-        }
-    }
-    proxy
-}
-
-/// Shadow for `wl_seat_get_pointer`. Captures the newly-created pointer proxy.
-///
-/// # Safety
-/// `seat` must be a valid `wl_seat *`.
-#[no_mangle]
-pub unsafe extern "C" fn wl_seat_get_pointer(seat: *mut c_void) -> *mut c_void {
-    let real = get_real(c"wl_seat_get_pointer");
-    let proxy = match real {
-        Some(f) => {
-            let func =
-                std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void) -> *mut c_void>(f);
-            func(seat)
-        }
-        None => std::ptr::null_mut(),
-    };
-    if !proxy.is_null() {
-        G_POINTER.store(proxy, Ordering::Release);
-    }
-    proxy
-}
-
-/// Shadow for `wl_seat_get_keyboard`. Captures the newly-created keyboard proxy.
-///
-/// # Safety
-/// `seat` must be a valid `wl_seat *`.
-#[no_mangle]
-pub unsafe extern "C" fn wl_seat_get_keyboard(seat: *mut c_void) -> *mut c_void {
-    let real = get_real(c"wl_seat_get_keyboard");
-    let proxy = match real {
-        Some(f) => {
-            let func =
-                std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void) -> *mut c_void>(f);
-            func(seat)
-        }
-        None => std::ptr::null_mut(),
-    };
-    if !proxy.is_null() {
-        G_KEYBOARD.store(proxy, Ordering::Release);
-    }
-    proxy
-}
-
 // ---------------------------------------------------------------------------
-// xdg_toplevel configure shim
+// Dispatch hooks — these replace the real functions via GOT patching
 // ---------------------------------------------------------------------------
 
-/// Per-toplevel saved listener state: `(original_configure_fn, user_data)`.
-/// Stored as `usize` because raw pointers are not `Send`.
-static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
-
-/// Shim that wraps the app's `xdg_toplevel_listener.configure`.
-///
-/// Updates `G_SURFACE_W` / `G_SURFACE_H` atomically, then forwards to the
-/// original listener so the application continues to work normally.
-extern "C" fn toplevel_configure_shim(
-    _data: *mut c_void,
-    toplevel: *mut c_void,
-    width: i32,
-    height: i32,
-    states: *mut c_void,
-) {
-    if width > 0 {
-        G_SURFACE_W.store(width as u32, Ordering::Release);
-    }
-    if height > 0 {
-        G_SURFACE_H.store(height as u32, Ordering::Release);
-    }
-    let key = toplevel as usize;
-    // Clone the entry while holding the lock, then drop the guard before
-    // calling the app's callback to avoid deadlock if the callback re-enters
-    // any code that also takes the TOPLEVEL_LISTENERS lock.
-    let entry = TOPLEVEL_LISTENERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|(k, _, _)| *k == key)
-        .copied();
-    if let Some((_, orig, orig_data)) = entry {
-        if orig != 0 {
-            // SAFETY: `orig` was saved from a valid listener function pointer.
-            let func = unsafe {
-                std::mem::transmute::<
-                    usize,
-                    extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void),
-                >(orig)
-            };
-            func(orig_data as *mut c_void, toplevel, width, height, states);
-        }
-    }
+unsafe extern "C" fn hook_dispatch(display: *mut c_void) -> c_int {
+    run_hooks(display);
+    let real: unsafe extern "C" fn(*mut c_void) -> c_int =
+        std::mem::transmute(REAL_DISPATCH.load(Ordering::SeqCst));
+    real(display)
 }
 
-/// Shadow for `wl_proxy_add_listener`.
-///
-/// We intercept this rather than the generated `xdg_toplevel_add_listener`
-/// wrapper because `wl_proxy_add_listener` is the actual libwayland-client
-/// symbol and is therefore always dynamically linked.  When the interface
-/// name is `"xdg_toplevel"` we allocate a shim listener that records surface
-/// size and forwards to the original.
-///
-/// # Safety
-/// `proxy` and `implementation` must be valid pointers.
-#[no_mangle]
-pub unsafe extern "C" fn wl_proxy_add_listener(
-    proxy: *mut c_void,
-    implementation: *mut *mut c_void,
-    data: *mut c_void,
+unsafe extern "C" fn hook_dispatch_pending(display: *mut c_void) -> c_int {
+    run_hooks(display);
+    let real: unsafe extern "C" fn(*mut c_void) -> c_int =
+        std::mem::transmute(REAL_DISPATCH_PENDING.load(Ordering::SeqCst));
+    real(display)
+}
+
+unsafe extern "C" fn hook_dispatch_queue(display: *mut c_void, queue: *mut c_void) -> c_int {
+    run_hooks(display);
+    let real: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
+        std::mem::transmute(REAL_DISPATCH_QUEUE.load(Ordering::SeqCst));
+    real(display, queue)
+}
+
+unsafe extern "C" fn hook_dispatch_queue_pending(
+    display: *mut c_void,
+    queue: *mut c_void,
 ) -> c_int {
-    let real = get_real(c"wl_proxy_add_listener");
-
-    let iface_name = proxy_interface_name(proxy);
-    if let Some(name) = iface_name {
-        if name == b"xdg_toplevel" && !implementation.is_null() {
-            G_XDG_TOPLEVEL.store(proxy, Ordering::Release);
-
-            // The listener struct is an array of function pointers whose
-            // length equals the interface's event count.
-            let p = proxy as *mut wl_proxy;
-            let event_count = (*(*p).object.interface).event_count as usize;
-            let shim_size = event_count * std::mem::size_of::<*mut c_void>();
-            let shim = libc::malloc(shim_size) as *mut *mut c_void;
-            if !shim.is_null() {
-                std::ptr::copy_nonoverlapping(implementation, shim, event_count);
-                let orig_configure = *shim;
-                if !orig_configure.is_null() {
-                    TOPLEVEL_LISTENERS
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((proxy as usize, orig_configure as usize, data as usize));
-                    *shim = toplevel_configure_shim as *mut c_void;
-                }
-                let result = match real {
-                    Some(f) => {
-                        let func = std::mem::transmute::<
-                            *mut c_void,
-                            extern "C" fn(*mut c_void, *mut *mut c_void, *mut c_void) -> c_int,
-                        >(f);
-                        func(proxy, shim, data)
-                    }
-                    None => -1,
-                };
-                // Intentionally leak `shim` — it must outlive the proxy.
-                return result;
-            }
-        }
-    }
-
-    if let Some(f) = real {
-        let func = std::mem::transmute::<
-            *mut c_void,
-            extern "C" fn(*mut c_void, *mut *mut c_void, *mut c_void) -> c_int,
-        >(f);
-        func(proxy, implementation, data)
-    } else {
-        -1
-    }
+    run_hooks(display);
+    let real: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
+        std::mem::transmute(REAL_DISPATCH_QUEUE_PENDING.load(Ordering::SeqCst));
+    real(display, queue)
 }
 
-/// Shadow for `wl_proxy_destroy`.
-///
-/// Removes the proxy from `TOPLEVEL_LISTENERS` so that destroyed toplevels
-/// do not leak entries or cause stale-pointer routing when the heap address
-/// is reused for a new toplevel.
-///
-/// # Safety
-/// `proxy` must be a valid `wl_proxy *`.
-#[no_mangle]
-pub unsafe extern "C" fn wl_proxy_destroy(proxy: *mut c_void) {
-    let real = get_real(c"wl_proxy_destroy");
-    // Prune our listener table before the proxy is freed.
-    TOPLEVEL_LISTENERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(k, _, _)| *k != proxy as usize);
-    if let Some(f) = real {
-        let func = std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void)>(f);
-        func(proxy)
-    }
-}
+// ---------------------------------------------------------------------------
+// GOT patching
+// ---------------------------------------------------------------------------
 
-const WL_MARSHAL_FLAG_DESTROY: u32 = 1 << 0;
-
-/// Cached real pointer for `wl_proxy_marshal_flags` so we don't call
-/// `dlsym` on the hot path.
-static REAL_MARSHAL_FLAGS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Shadow for `wl_proxy_marshal_flags`.
-///
-/// Modern apps destroy xdg_toplevel via `wl_proxy_marshal_flags(..., WL_MARSHAL_FLAG_DESTROY)`,
-/// which routes through an internal `wl_proxy_destroy_caller_locks` path that
-/// bypasses the public `wl_proxy_destroy` PLT entry.
-///
-/// The real symbol is variadic.  We use inline asm to forward all
-/// register and stack arguments unchanged, clearing `%al` so the real
-/// function's `va_start` does not try to read garbage from vector
-/// registers.
-///
-/// # Safety
-/// `proxy` must be a valid `wl_proxy *`.
-#[no_mangle]
-pub unsafe extern "C" fn wl_proxy_marshal_flags(
-    proxy: *mut c_void,
-    opcode: u32,
-    interface: *const c_void,
-    version: u32,
-    flags: u32,
-    // variadic args follow in r9, r10, r11 and on the stack
-) -> *mut c_void {
-    let real = REAL_MARSHAL_FLAGS.load(Ordering::Relaxed);
-    let real = if real.is_null() {
-        if let Some(p) = get_real(c"wl_proxy_marshal_flags") {
-            REAL_MARSHAL_FLAGS.store(p, Ordering::Relaxed);
-            p
-        } else {
-            return std::ptr::null_mut();
-        }
-    } else {
-        real
+/// Patch the GOT entry for `symbol` in every loaded module to point to `hook`.
+unsafe fn patch_all_gots(symbol: &str, hook: *mut c_void) {
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(m) => m,
+        Err(_) => return,
     };
 
-    let mut result: *mut c_void = std::ptr::null_mut();
-    std::arch::asm!(
-        "xor eax, eax",
-        "call r12",
-        in("r12") real,
-        lateout("rax") result,
-        in("rdi") proxy,
-        in("rsi") opcode,
-        in("rdx") interface,
-        in("rcx") version,
-        in("r8") flags,
-        lateout("r9") _, lateout("r10") _, lateout("r11") _,
-        lateout("xmm0") _, lateout("xmm1") _, lateout("xmm2") _,
-        lateout("xmm3") _, lateout("xmm4") _, lateout("xmm5") _,
-        lateout("xmm6") _, lateout("xmm7") _,
-    );
+    let mut seen = std::collections::HashSet::new();
 
-    // Side effects: prune destroyed toplevels, capture new proxies.
-    if !result.is_null() && !interface.is_null() {
-        if flags & WL_MARSHAL_FLAG_DESTROY != 0 {
-            TOPLEVEL_LISTENERS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|(k, _, _)| *k != proxy as usize);
-        }
-
-        let iface_name = CStr::from_ptr((*(interface as *const wl_interface)).name).to_bytes();
-        if iface_name == b"wl_pointer" {
-            G_POINTER.store(result, Ordering::Release);
-        } else if iface_name == b"wl_keyboard" {
-            G_KEYBOARD.store(result, Ordering::Release);
-        } else if iface_name == b"xdg_toplevel" {
-            G_XDG_TOPLEVEL.store(result, Ordering::Release);
-        }
-    }
-
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Initial sweep
-// ---------------------------------------------------------------------------
-
-/// Walk libwayland's internal `wl_display.objects` proxy table and capture
-/// any `wl_seat`, `wl_pointer`, `wl_keyboard`, or `xdg_toplevel` proxies
-/// that already exist at injection time.
-///
-/// # Safety
-/// `display` must be a valid `wl_display *`.
-unsafe fn initial_sweep(display: *mut c_void) {
-    let d = display as *mut wl_display_header;
-    let map = &(*d).objects;
-    let entries = map.client_entries.data as *const *mut c_void;
-    if entries.is_null() {
-        return;
-    }
-    let count = map.client_entries.size / std::mem::size_of::<*mut c_void>();
-    if count == 0 {
-        return;
-    }
-    let slice = std::slice::from_raw_parts(entries, count);
-    for &proxy_ptr in slice {
-        if proxy_ptr.is_null() {
+    for line in maps.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 6 {
             continue;
         }
-        if let Some(name) = proxy_interface_name(proxy_ptr) {
-            match name {
-                b"wl_seat" => {
-                    G_SEAT.store(proxy_ptr, Ordering::Release);
+        let path = parts[5];
+        if !path.starts_with('/') {
+            continue;
+        }
+
+        let addr_range: Vec<&str> = parts[0].split('-').collect();
+        if addr_range.len() != 2 {
+            continue;
+        }
+        let base = match usize::from_str_radix(addr_range[0], 16) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        if !seen.insert(path.to_string()) {
+            continue;
+        }
+
+        patch_got_in_module(base, path, symbol, hook);
+    }
+}
+
+/// Read `/proc/self/maps` to determine the original protection of the page
+/// containing `addr`.
+unsafe fn page_protection(addr: usize) -> Option<i32> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let range: Vec<&str> = parts[0].split('-').collect();
+        if range.len() != 2 {
+            continue;
+        }
+        let start = usize::from_str_radix(range[0], 16).ok()?;
+        let end = usize::from_str_radix(range[1], 16).ok()?;
+        if addr >= start && addr < end {
+            let perms = parts[1].as_bytes();
+            let mut prot = 0;
+            if perms.first() == Some(&b'r') {
+                prot |= libc::PROT_READ;
+            }
+            if perms.get(1) == Some(&b'w') {
+                prot |= libc::PROT_WRITE;
+            }
+            if perms.get(2) == Some(&b'x') {
+                prot |= libc::PROT_EXEC;
+            }
+            return Some(prot);
+        }
+    }
+    None
+}
+
+unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut c_void) {
+    // Never patch libwayland-client itself — it *defines* these symbols.
+    if path.contains("libwayland-client") {
+        return;
+    }
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let elf = match goblin::Object::parse(&data) {
+        Ok(goblin::Object::Elf(e)) => e,
+        _ => return,
+    };
+
+    // Walk .rela.plt and .rela.dyn relocations.
+    let relocs: Vec<_> = elf.pltrelocs.iter().chain(elf.dynrelas.iter()).collect();
+
+    for rela in &relocs {
+        let sym = match elf.dynsyms.get(rela.r_sym) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let sym_name = elf.dynstrtab.get_at(sym.st_name);
+        if sym_name != Some(symbol) {
+            continue;
+        }
+
+        // Only patch imports (undefined symbols), not internal references.
+        if sym.st_shndx as u32 != goblin::elf::section_header::SHN_UNDEF || sym.st_value != 0 {
+            continue;
+        }
+
+        let got_entry = (base + rela.r_offset as usize) as *mut *mut c_void;
+
+        // Save the real pointer.
+        let real = *got_entry;
+        store_real(symbol, real);
+
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let page_start = (got_entry as usize) & !(page_size - 1);
+        let old_prot = page_protection(page_start);
+
+        if old_prot.is_none() {
+            continue;
+        }
+
+        // Make the page writable.
+        let ret = libc::mprotect(
+            page_start as *mut c_void,
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
+        if ret != 0 {
+            continue;
+        }
+
+        // Write our hook.
+        *got_entry = hook;
+
+        // Restore original protection.
+        if let Some(prot) = old_prot {
+            let _ = libc::mprotect(page_start as *mut c_void, page_size, prot);
+        }
+
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic input dispatch
+// ---------------------------------------------------------------------------
+
+fn dispatch_event(display: *mut c_void, cmd: IpcCommand) {
+    match cmd {
+        IpcCommand::MouseMove { x, y } => {
+            if let Some(ptr) = get_pointer_proxy() {
+                unsafe {
+                    let serial = next_serial();
+                    wl_pointer_motion(ptr, serial, display, x, y);
                 }
-                b"wl_pointer" => {
-                    G_POINTER.store(proxy_ptr, Ordering::Release);
+            }
+        }
+        IpcCommand::MouseButton { button, state } => {
+            if let Some(ptr) = get_pointer_proxy() {
+                unsafe {
+                    let serial = next_serial();
+                    wl_pointer_button(ptr, serial, display, button, state);
                 }
-                b"wl_keyboard" => {
-                    G_KEYBOARD.store(proxy_ptr, Ordering::Release);
+            }
+        }
+        IpcCommand::Key { key, state } => {
+            if let Some(kbd) = get_keyboard_proxy() {
+                unsafe {
+                    let serial = next_serial();
+                    wl_keyboard_key(kbd, serial, display, key, state);
                 }
-                b"xdg_toplevel" => {
-                    G_XDG_TOPLEVEL.store(proxy_ptr, Ordering::Release);
+            }
+        }
+        IpcCommand::Modifiers { depressed } => {
+            if let Some(kbd) = get_keyboard_proxy() {
+                unsafe {
+                    let serial = next_serial();
+                    wl_keyboard_modifiers(kbd, serial, display, depressed);
                 }
-                _ => {}
             }
         }
     }
 }
 
+fn get_pointer_proxy() -> Option<*mut c_void> {
+    let p = G_POINTER.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+fn get_keyboard_proxy() -> Option<*mut c_void> {
+    let p = G_KEYBOARD.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
 // ---------------------------------------------------------------------------
-// IPC types
+// libwayland protocol helpers
 // ---------------------------------------------------------------------------
 
-/// Request deserialized from the Unix socket (one line of JSON per request).
+static SERIAL: AtomicU32 = AtomicU32::new(1);
+
+fn next_serial() -> u32 {
+    SERIAL.fetch_add(1, Ordering::SeqCst)
+}
+
+fn monotonic_ms() -> u32 {
+    let ts = unsafe {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr());
+        ts.assume_init()
+    };
+    (ts.tv_sec as u32)
+        .wrapping_mul(1000)
+        .wrapping_add((ts.tv_nsec / 1_000_000) as u32)
+}
+
+fn to_fixed(v: f64) -> i32 {
+    (v * 256.0).round() as i32
+}
+
+/// Emulate `wl_pointer.motion`.
+unsafe fn wl_pointer_motion(
+    proxy: *mut c_void,
+    serial: u32,
+    _display: *mut c_void,
+    x: f64,
+    y: f64,
+) {
+    let mut args: [u64; 4] = [
+        serial as u64,
+        monotonic_ms() as u64,
+        to_fixed(x) as u64,
+        to_fixed(y) as u64,
+    ];
+    wl_proxy_marshal(proxy, 4, args.as_mut_ptr());
+    wl_proxy_marshal(proxy, 5, args.as_mut_ptr());
+}
+
+/// Emulate `wl_pointer.button`.
+unsafe fn wl_pointer_button(
+    proxy: *mut c_void,
+    serial: u32,
+    _display: *mut c_void,
+    button: u32,
+    state: u32,
+) {
+    let mut args: [u64; 4] = [
+        serial as u64,
+        monotonic_ms() as u64,
+        button as u64,
+        state as u64,
+    ];
+    wl_proxy_marshal(proxy, 3, args.as_mut_ptr());
+    wl_proxy_marshal(proxy, 5, args.as_mut_ptr());
+}
+
+/// Emulate `wl_keyboard.key`.
+unsafe fn wl_keyboard_key(
+    proxy: *mut c_void,
+    serial: u32,
+    _display: *mut c_void,
+    key: u32,
+    state: u32,
+) {
+    let mut args: [u64; 4] = [
+        serial as u64,
+        monotonic_ms() as u64,
+        key as u64,
+        state as u64,
+    ];
+    wl_proxy_marshal(proxy, 3, args.as_mut_ptr());
+}
+
+/// Emulate `wl_keyboard.modifiers`.
+unsafe fn wl_keyboard_modifiers(
+    proxy: *mut c_void,
+    serial: u32,
+    _display: *mut c_void,
+    depressed: u32,
+) {
+    let mut args: [u64; 5] = [
+        serial as u64,
+        depressed as u64,
+        0, // mods_latched
+        0, // mods_locked
+        0, // group
+    ];
+    wl_proxy_marshal(proxy, 4, args.as_mut_ptr());
+}
+
+/// Low-level proxy marshalling — matches libwayland's `wl_proxy_marshal`.
+unsafe fn wl_proxy_marshal(proxy: *mut c_void, opcode: u32, args: *mut u64) {
+    let func: unsafe extern "C" fn(*mut c_void, u32, ...) =
+        std::mem::transmute(libc::dlsym(libc::RTLD_NEXT, c"wl_proxy_marshal".as_ptr()));
+    let a = std::slice::from_raw_parts(args, 5);
+    func(proxy, opcode, a[0], a[1], a[2], a[3], a[4]);
+}
+
+// ---------------------------------------------------------------------------
+// IPC protocol
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, serde::Deserialize)]
 struct IpcRequest {
     #[serde(rename = "type")]
@@ -616,423 +624,188 @@ struct IpcRequest {
     #[serde(default)]
     key: Option<u32>,
     #[serde(default)]
-    axis: Option<u32>,
-    #[serde(default)]
-    value: Option<f64>,
-    #[serde(default)]
     depressed: Option<u32>,
 }
 
-/// Parsed command ready to be queued for dispatch on the app's event thread.
 #[derive(Debug, Clone)]
 enum IpcCommand {
     MouseMove { x: f64, y: f64 },
-    MouseButton { button: u32, pressed: bool },
-    Key { key: u32, pressed: bool },
-    Scroll { axis: u32, value: f64 },
+    MouseButton { button: u32, state: u32 },
+    Key { key: u32, state: u32 },
     Modifiers { depressed: u32 },
 }
 
-/// Build a generic `{"status":"ok"}` response.
-fn make_ok() -> String {
-    r#"{"status":"ok"}"#.to_string() + "\n"
-}
-
-/// Build a `{"status":"ok","width":w,"height":h}` response.
-fn make_ok_size(w: u32, h: u32) -> String {
-    format!(r#"{{"status":"ok","width":{},"height":{}}}"#, w, h) + "\n"
-}
-
-/// Build a `{"status":"error","code":...,"message":...}` response.
-fn make_error(code: &str, message: &str, kind: Option<&str>) -> String {
-    let mut obj = serde_json::Map::new();
-    obj.insert(
-        "status".to_string(),
-        serde_json::Value::String("error".to_string()),
-    );
-    obj.insert(
-        "code".to_string(),
-        serde_json::Value::String(code.to_string()),
-    );
-    obj.insert(
-        "message".to_string(),
-        serde_json::Value::String(message.to_string()),
-    );
-    if let Some(k) = kind {
-        obj.insert("kind".to_string(), serde_json::Value::String(k.to_string()));
-    }
-    serde_json::Value::Object(obj).to_string() + "\n"
-}
-
-/// Build the handshake acknowledgement line.
-fn make_hello_ack() -> String {
-    r#"{"type":"hello_ack","protocol_version":1,"payload_version":"0.2.2"}"#.to_string() + "\n"
-}
-
-/// Build the status response used to report whether PLT interposition is
-/// active.
-///
-/// Reports `G_DISPATCH_CALLED` — the only definitive signal that the
-/// dispatch hook has actually fired (as opposed to `G_INTERPOSITION_OK`,
-/// which may be true for BIND_NOW targets even when the hook never runs).
-fn make_status() -> String {
-    format!(
-        r#"{{"status":"ok","dispatch_hook_installed":{}}}"#,
-        G_DISPATCH_CALLED.load(Ordering::Acquire)
-    ) + "\n"
-}
-
-// ---------------------------------------------------------------------------
-// Wayland fixed-point and serial helpers
-// ---------------------------------------------------------------------------
-
-/// Convert a floating-point value to Wayland's signed 24.8 fixed-point
-/// (`wl_fixed_t`).
-fn to_fixed(v: f64) -> i32 {
-    (v * 256.0).round() as i32
-}
-
-/// Monotonically-increasing serial counter used for synthetic button/key
-/// events when `wl_display_get_serial` is not available.
-static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
-
-fn next_serial() -> u32 {
-    SERIAL_COUNTER.fetch_add(1, Ordering::SeqCst)
-}
-
-/// Return a `CLOCK_MONOTONIC` timestamp in milliseconds, suitable for
-/// Wayland event timestamps.
-fn monotonic_ms() -> u32 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid out-param.
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
-    (ts.tv_sec as u64)
-        .saturating_mul(1000)
-        .saturating_add(ts.tv_nsec as u64 / 1_000_000) as u32
-}
-
-// ---------------------------------------------------------------------------
-// Event dispatch on app thread
-// ---------------------------------------------------------------------------
-
-/// Dispatch a single queued command by calling the application's listener
-/// callback directly.
-///
-/// # Safety
-/// Must run on the application's Wayland event thread (i.e. inside
-/// `wl_display_dispatch`).
-unsafe fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
-    match cmd {
-        IpcCommand::MouseMove { x, y } => {
-            dispatch_mouse_move(x, y);
-            dispatch_pointer_frame();
-        }
-        IpcCommand::MouseButton { button, pressed } => {
-            dispatch_mouse_button(button, pressed);
-            dispatch_pointer_frame();
-        }
-        IpcCommand::Key { key, pressed } => {
-            dispatch_key(key, pressed);
-        }
-        IpcCommand::Scroll { axis, value } => {
-            dispatch_scroll(axis, value);
-            dispatch_pointer_frame();
-        }
-        IpcCommand::Modifiers { depressed } => {
-            dispatch_modifiers(depressed);
-        }
-    }
-}
-
-/// Retrieve a function pointer from a `wl_proxy`'s listener struct at the
-/// given `offset` (in pointer-sized units).
-///
-/// Returns `None` for dispatcher-style proxies (wayland-rs, winit, etc.)
-/// which use a `dispatcher` callback instead of a listener function table.
-/// Full dispatcher support is not yet implemented.
-///
-/// # Safety
-/// `proxy` must be a valid `wl_proxy *` with a non-null listener.
-unsafe fn get_listener_func(proxy: *mut c_void, offset: usize) -> Option<*mut c_void> {
-    if proxy.is_null() {
-        return None;
-    }
-    let p = proxy.cast::<wl_proxy>();
-    if !(*p).dispatcher.is_null() {
-        return None;
-    }
-    let listener = (*p).object.implementation;
-    if listener.is_null() {
-        return None;
-    }
-    let ptr = *((listener as *mut *mut c_void).add(offset));
-    if ptr.is_null() {
-        return None;
-    }
-    Some(ptr)
-}
-
-/// Dispatch a synthetic `wl_pointer_listener.motion` event.
-///
-/// # Safety
-/// Must run on the app's Wayland event thread.
-unsafe fn dispatch_mouse_move(x: f64, y: f64) {
-    let proxy = G_POINTER.load(Ordering::Acquire);
-    let Some(func_ptr) = get_listener_func(proxy, 2) else {
-        return;
-    };
-    let motion = std::mem::transmute::<
-        *mut c_void,
-        extern "C" fn(*mut c_void, *mut c_void, u32, i32, i32),
-    >(func_ptr);
-    let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = monotonic_ms();
-    motion(data, proxy, time, to_fixed(x), to_fixed(y));
-}
-
-/// Dispatch a synthetic `wl_pointer_listener.button` event.
-///
-/// # Safety
-/// Must run on the app's Wayland event thread.
-unsafe fn dispatch_mouse_button(button: u32, pressed: bool) {
-    let proxy = G_POINTER.load(Ordering::Acquire);
-    let Some(func_ptr) = get_listener_func(proxy, 3) else {
-        return;
-    };
-    let func = std::mem::transmute::<
-        *mut c_void,
-        extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32),
-    >(func_ptr);
-    let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = monotonic_ms();
-    let state = if pressed { 1 } else { 0 };
-    func(data, proxy, next_serial(), time, button, state);
-}
-
-/// Dispatch a synthetic `wl_keyboard_listener.key` event.
-///
-/// # Safety
-/// Must run on the app's Wayland event thread.
-unsafe fn dispatch_key(key: u32, pressed: bool) {
-    let proxy = G_KEYBOARD.load(Ordering::Acquire);
-    let Some(func_ptr) = get_listener_func(proxy, 3) else {
-        return;
-    };
-    let func = std::mem::transmute::<
-        *mut c_void,
-        extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32),
-    >(func_ptr);
-    let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = monotonic_ms();
-    let state = if pressed { 1 } else { 0 };
-    func(data, proxy, next_serial(), time, key, state);
-}
-
-/// Dispatch a synthetic `wl_pointer_listener.axis` event.
-///
-/// # Safety
-/// Must run on the app's Wayland event thread.
-unsafe fn dispatch_scroll(axis: u32, value: f64) {
-    let proxy = G_POINTER.load(Ordering::Acquire);
-    let Some(func_ptr) = get_listener_func(proxy, 4) else {
-        return;
-    };
-    let func = std::mem::transmute::<
-        *mut c_void,
-        extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32),
-    >(func_ptr);
-    let data = (*proxy.cast::<wl_proxy>()).user_data;
-    let time = monotonic_ms();
-    func(data, proxy, time, axis, to_fixed(value));
-}
-
-/// Dispatch a synthetic `wl_pointer_listener.frame` event.
-///
-/// Wayland 1.10+ requires this to complete a pointer event batch.
-/// Without it, toolkits (GTK4, Qt6, SDL3, winit) buffer and discard
-/// partial pointer events.
-///
-/// # Safety
-/// Must run on the app's Wayland event thread.
-unsafe fn dispatch_pointer_frame() {
-    let proxy = G_POINTER.load(Ordering::Acquire);
-    let Some(func_ptr) = get_listener_func(proxy, 5) else {
-        return;
-    };
-    let func =
-        std::mem::transmute::<*mut c_void, extern "C" fn(*mut c_void, *mut c_void)>(func_ptr);
-    let data = (*proxy.cast::<wl_proxy>()).user_data;
-    func(data, proxy);
-}
-
-/// Dispatch a synthetic `wl_keyboard_listener.modifiers` event.
-///
-/// Modern toolkits expect this before/after key events that change
-/// modifier state (e.g. Shift for capital letters).
-///
-/// # Safety
-/// Must run on the app's Wayland event thread.
-unsafe fn dispatch_modifiers(depressed: u32) {
-    let proxy = G_KEYBOARD.load(Ordering::Acquire);
-    let Some(func_ptr) = get_listener_func(proxy, 1) else {
-        return;
-    };
-    let func = std::mem::transmute::<
-        *mut c_void,
-        extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32, u32),
-    >(func_ptr);
-    let data = (*proxy.cast::<wl_proxy>()).user_data;
-    func(data, proxy, next_serial(), depressed, 0, 0, 0);
-}
-
-// ---------------------------------------------------------------------------
-// IPC command handling
-// ---------------------------------------------------------------------------
-
-/// Result of handling one JSON request line.
 enum HandleResult {
-    /// Normal JSON response to write back to the host.
     Response(String),
-    /// The host requested unload — the IPC thread should clean up and exit.
     Unload,
 }
 
-/// Parse one JSON request line and produce a response.
+fn parse_state(s: &str) -> u32 {
+    match s {
+        "pressed" => 1,
+        "released" => 0,
+        _ => 0,
+    }
+}
+
 fn handle_request(line: &str) -> HandleResult {
     let req: IpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
-        Err(_) => {
-            return HandleResult::Response(make_error(
-                "invalid_json",
-                "could not parse request",
-                None,
-            ));
+        Err(e) => {
+            return HandleResult::Response(make_error("invalid_json", &e.to_string()));
         }
     };
 
     match req.ty.as_str() {
-        "hello" => HandleResult::Response(make_hello_ack()),
+        "hello" => HandleResult::Response(
+            r#"{"type":"hello_ack","protocol_version":1,"payload_version":"0.2.2"}"#.to_string(),
+        ),
         "mouse_move" => {
             let x = req.x.unwrap_or(0.0);
             let y = req.y.unwrap_or(0.0);
-            HandleResult::Response(queue_cmd(IpcCommand::MouseMove { x, y }))
+            {
+                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                q.push_back(IpcCommand::MouseMove { x, y });
+            }
+            HandleResult::Response(make_ok())
         }
         "mouse_button" => {
             let button = req.button.unwrap_or(0);
-            let pressed = req.state.as_deref() == Some("pressed");
-            HandleResult::Response(queue_cmd(IpcCommand::MouseButton { button, pressed }))
+            let state = parse_state(&req.state.unwrap_or_default());
+            {
+                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                q.push_back(IpcCommand::MouseButton { button, state });
+            }
+            HandleResult::Response(make_ok())
         }
         "key" => {
             let key = req.key.unwrap_or(0);
-            let pressed = req.state.as_deref() == Some("pressed");
-            HandleResult::Response(queue_cmd(IpcCommand::Key { key, pressed }))
-        }
-        "scroll" => {
-            let axis = req.axis.unwrap_or(0);
-            let value = req.value.unwrap_or(0.0);
-            HandleResult::Response(queue_cmd(IpcCommand::Scroll { axis, value }))
+            let state = parse_state(&req.state.unwrap_or_default());
+            {
+                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                q.push_back(IpcCommand::Key { key, state });
+            }
+            HandleResult::Response(make_ok())
         }
         "modifiers" => {
             let depressed = req.depressed.unwrap_or(0);
-            HandleResult::Response(queue_cmd(IpcCommand::Modifiers { depressed }))
+            {
+                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                q.push_back(IpcCommand::Modifiers { depressed });
+            }
+            HandleResult::Response(make_ok())
         }
         "surface_size" => {
             if G_XDG_TOPLEVEL.load(Ordering::Acquire).is_null() {
                 return HandleResult::Response(make_error(
                     "proxy_not_found",
                     "xdg_toplevel not captured yet",
-                    Some("xdg_toplevel"),
                 ));
             }
             let w = G_SURFACE_W.load(Ordering::Acquire);
             let h = G_SURFACE_H.load(Ordering::Acquire);
-            if w == 0 || h == 0 {
-                return HandleResult::Response(make_error(
-                    "proxy_not_found",
-                    "surface size not yet configured",
-                    Some("xdg_toplevel"),
-                ));
-            }
-            HandleResult::Response(make_ok_size(w, h))
+            HandleResult::Response(format!(r#"{{"status":"ok","width":{},"height":{}}}"#, w, h))
         }
-        "rescan" => {
-            let display = G_DISPLAY.load(Ordering::Acquire);
-            if display.is_null() {
-                return HandleResult::Response(make_error(
-                    "dispatch_hook_not_installed",
-                    "display not yet seen",
-                    None,
-                ));
-            }
-            // SAFETY: `display` was stored by the dispatch hook and is valid.
-            unsafe { initial_sweep(display) };
-            HandleResult::Response(make_ok())
-        }
-        "unload" => HandleResult::Unload,
-        "status" => HandleResult::Response(make_status()),
-        _ => HandleResult::Response(make_error(
-            "unknown_command",
-            "unrecognized request type",
-            None,
+        "status" => HandleResult::Response(format!(
+            r#"{{"status":"ok","dispatch_hook_installed":{}}}"#,
+            G_DISPATCH_CALLED.load(Ordering::Acquire)
         )),
+        "unload" => HandleResult::Unload,
+        _ => HandleResult::Response(make_error("unknown_command", &req.ty)),
     }
 }
 
-/// Push a command into the queue that will be drained by the next
-/// `wl_display_dispatch` call.
-fn queue_cmd(cmd: IpcCommand) -> String {
-    COMMAND_QUEUE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back(cmd);
-    make_ok()
+fn make_ok() -> String {
+    r#"{"status":"ok"}"#.to_string()
+}
+
+fn make_error(code: &str, message: &str) -> String {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "status".to_string(),
+        serde_json::Value::String("error".to_string()),
+    );
+    m.insert(
+        "code".to_string(),
+        serde_json::Value::String(code.to_string()),
+    );
+    m.insert(
+        "message".to_string(),
+        serde_json::Value::String(message.to_string()),
+    );
+    serde_json::to_string(&m).unwrap()
 }
 
 // ---------------------------------------------------------------------------
 // IPC thread
 // ---------------------------------------------------------------------------
 
-/// Return a suitable runtime directory for temporary files.
-///
-/// Prefers `$XDG_RUNTIME_DIR` (user-owned, typically `/run/user/<uid>`),
-/// falling back to `/tmp`.  Must match the host's `session::runtime_dir()`.
 fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// Accept a single IPC connection and process newline-delimited JSON requests
-/// until the host sends `unload` or the connection closes.
+/// Buffer that holds the socket path passed in by the host.
+static mut BACKSEAT_SOCK_PATH: [u8; 256] = [0; 256];
+
+fn log(msg: &str) {
+    let _ = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("/tmp/backseat-debug.log")
+        .and_then(|mut f| f.write_all(msg.as_bytes()));
+}
+
 fn ipc_thread() {
     let pid = unsafe { libc::getpid() };
-    let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
+
+    let sock_path = unsafe {
+        let buf_ptr = std::ptr::addr_of!(BACKSEAT_SOCK_PATH).cast::<u8>();
+        if *buf_ptr != 0 {
+            let mut len = 0usize;
+            while len < 256 && *buf_ptr.add(len) != 0 {
+                len += 1;
+            }
+            PathBuf::from(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                buf_ptr, len,
+            )))
+        } else {
+            runtime_dir().join(format!("backseat-{}.sock", pid))
+        }
+    };
+
     let sock_path_cstring = std::ffi::CString::new(sock_path.to_string_lossy().as_bytes()).unwrap();
     let _ = std::fs::remove_file(&sock_path);
 
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
-        Err(_) => return,
+        Err(_) => {
+            log(&format!("bind failed: {}\n", sock_path.display()));
+            IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
+            return;
+        }
     };
 
-    // Restrict socket permissions so only the owner can connect.
     unsafe {
         libc::chmod(sock_path_cstring.as_ptr(), 0o700);
     }
 
     let (stream, _) = match listener.accept() {
         Ok(v) => v,
-        Err(_) => return,
+        Err(e) => {
+            log(&format!("accept failed: {}\n", e));
+            IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
+            return;
+        }
     };
 
     let mut write_stream = match stream.try_clone() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => {
+            IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
+            return;
+        }
     };
     let mut reader = std::io::BufReader::new(stream);
     let mut line = String::new();
@@ -1042,6 +815,7 @@ fn ipc_thread() {
             break;
         }
         let line_trimmed = line.trim();
+
         if line_trimmed.is_empty() {
             line.clear();
             continue;
@@ -1050,6 +824,7 @@ fn ipc_thread() {
         match handle_request(line_trimmed) {
             HandleResult::Response(response) => {
                 let _ = write_stream.write_all(response.as_bytes());
+                let _ = write_stream.write_all(b"\n");
             }
             HandleResult::Unload => {
                 let _ = write_stream.write_all(make_ok().as_bytes());
@@ -1059,38 +834,79 @@ fn ipc_thread() {
         }
         line.clear();
     }
+    // Allow re-injection after unload.
+    IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
 
-/// `.init_array` entry point — runs automatically when the `.so` is loaded.
-/// Spawns the IPC listener thread (once only).
 #[used]
 #[link_section = ".init_array"]
 static CONSTRUCTOR: extern "C" fn() = init;
 
-/// Set to `true` if the init() self-check confirms that our PLT shadow
-/// symbols are visible to the dynamic linker.
-static G_INTERPOSITION_OK: AtomicBool = AtomicBool::new(false);
-
 extern "C" fn init() {
+    unsafe {
+        patch_all_gots("wl_display_dispatch", hook_dispatch as *mut c_void);
+        patch_all_gots(
+            "wl_display_dispatch_pending",
+            hook_dispatch_pending as *mut c_void,
+        );
+        patch_all_gots(
+            "wl_display_dispatch_queue",
+            hook_dispatch_queue as *mut c_void,
+        );
+        patch_all_gots(
+            "wl_display_dispatch_queue_pending",
+            hook_dispatch_queue_pending as *mut c_void,
+        );
+    }
+}
+
+/// Host-visible entry point. Receives the Unix-socket path and starts IPC.
+///
+/// # Safety
+/// `path` must be a valid null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn backseat_init(path: *const c_char) {
+    if !path.is_null() {
+        let bytes = CStr::from_ptr(path).to_bytes_with_nul();
+        let len = bytes.len().min(256);
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            std::ptr::addr_of_mut!(BACKSEAT_SOCK_PATH).cast::<u8>(),
+            len,
+        );
+    }
+
+    extern "C" fn ipc_thread_wrapper(_arg: *mut c_void) -> *mut c_void {
+        ipc_thread();
+        std::ptr::null_mut()
+    }
+
     if IPC_THREAD_STARTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        // Self-check: ask the dynamic linker to resolve "wl_display_dispatch".
-        // If it returns OUR function, PLT interposition is working for future
-        // dispatches.  (For BIND_NOW targets the PLT was already resolved and
-        // this check may still return our address — the only definitive test
-        // is whether run_hooks fires, tracked by G_DISPATCH_CALLED.)
-        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"wl_display_dispatch".as_ptr()) };
-        let ours = wl_display_dispatch as *const () as usize as *mut c_void;
-        G_INTERPOSITION_OK.store(sym == ours, Ordering::Release);
-        std::thread::spawn(ipc_thread);
+        unsafe {
+            let mut tid: libc::pthread_t = 0;
+            let ret = libc::pthread_create(
+                &mut tid,
+                std::ptr::null(),
+                ipc_thread_wrapper,
+                std::ptr::null_mut(),
+            );
+            if ret != 0 {
+                log(&format!("pthread_create failed: {}\n", ret));
+            }
+        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1098,11 +914,8 @@ mod tests {
 
     #[test]
     fn to_fixed_rounds_half_up() {
-        // 1.5 * 256 = 384.0 -> exactly 384
         assert_eq!(to_fixed(1.5), 384);
-        // 1.501 * 256 = 384.256 -> rounds to 384
         assert_eq!(to_fixed(1.501), 384);
-        // 1.505 * 256 = 385.28 -> rounds to 385
         assert_eq!(to_fixed(1.505), 385);
     }
 

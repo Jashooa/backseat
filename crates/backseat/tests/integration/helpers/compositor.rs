@@ -4,15 +4,18 @@
 //! with a custom socket name so tests don't collide with each other or
 //! the host's Wayland session.
 
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 /// A running headless Weston compositor.
 ///
-/// On drop the compositor process is killed (SIGKILL if SIGTERM doesn't
-/// work within a timeout).
+/// Launched in its own process group so that dropping it kills every
+/// child (`weston-keyboard`, `weston-desktop-shell`) along with the
+/// compositor itself.
 pub struct Compositor {
     child: Child,
+    pgid: i32,
     runtime_dir: PathBuf,
     socket_name: String,
 }
@@ -29,25 +32,31 @@ impl Compositor {
 
         let socket_name = format!("wayland-backseat-test-{}", std::process::id());
 
-        let child = Command::new("weston")
-            .args([
-                "--backend=headless",
-                &format!("--socket={socket_name}"),
-                "--config=/dev/null",
-                "--no-config",
-            ])
-            .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("WAYLAND_DISPLAY", &socket_name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        let mut cmd = Command::new("weston");
+        cmd.args([
+            "--backend=headless",
+            &format!("--socket={socket_name}"),
+            "--config=/dev/null",
+            "--no-config",
+        ])
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("WAYLAND_DISPLAY", &socket_name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Create a new process group so we can kill the whole tree.
+        .process_group(0);
+
+        let child = cmd
             .spawn()
             .expect("Failed to start weston -- is it installed?");
+        let pgid = child.id() as i32;
 
         // Give weston a moment to create the socket.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         Self {
             child,
+            pgid,
             runtime_dir,
             socket_name,
         }
@@ -66,7 +75,10 @@ impl Compositor {
 
 impl Drop for Compositor {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // Kill the entire process group immediately — no graceful wait.
+        // Weston's children (weston-keyboard, weston-desktop-shell)
+        // don't respond to SIGTERM reliably in headless mode.
+        let _ = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
     }

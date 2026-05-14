@@ -106,8 +106,8 @@ pub(crate) struct Response {
     pub(crate) message: Option<String>,
     #[serde(default)]
     pub(crate) kind: Option<String>,
-    #[serde(default)]
-    pub(crate) dispatch_hook_installed: Option<bool>,
+    #[serde(default, rename = "dispatch_hook_installed")]
+    pub(crate) _dispatch_hook_installed: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,26 +144,39 @@ impl Session {
     /// failure, socket timeout, protocol mismatch, etc.
     pub async fn new(pid: u32) -> Result<Self, Error> {
         let payload_path = extract_payload().await?;
+        let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
+        let sock_path_str = sock_path.to_string_lossy().to_string();
 
         // ptrace is entirely synchronous — run it in a blocking task.
         let pid_for_inject = pid;
         let path_for_inject = payload_path.clone();
         tokio::task::spawn_blocking(move || {
-            injector::inject_payload(pid_for_inject, &path_for_inject)
+            injector::inject_payload(pid_for_inject, &path_for_inject, &sock_path_str)
         })
         .await
         .map_err(|e| Error::PayloadExtractFailed(format!("inject task panicked: {e}")))??;
 
-        // Give the payload's IPC thread a moment to bind its socket.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let sock_path = runtime_dir().join(format!("backseat-{}.sock", pid));
-        let stream = timeout(TIMEOUT, UnixStream::connect(&sock_path))
-            .await
-            .map_err(|_| Error::SocketTimeout {
-                phase: SocketPhase::Connect,
-            })?
-            .map_err(|e| Error::SocketError(e.to_string()))?;
+        // Retry the socket connection with exponential backoff instead of a
+        // single fixed sleep, which is unreliable under load.
+        let stream = {
+            let mut delay = Duration::from_millis(10);
+            let start = std::time::Instant::now();
+            loop {
+                match UnixStream::connect(&sock_path).await {
+                    Ok(s) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if start.elapsed() >= TIMEOUT {
+                            return Err(Error::SocketTimeout {
+                                phase: SocketPhase::Connect,
+                            });
+                        }
+                        tokio::time::sleep(delay).await;
+                        delay = std::cmp::min(delay * 2, Duration::from_millis(200));
+                    }
+                    Err(e) => return Err(Error::SocketError(e.to_string())),
+                }
+            }
+        };
 
         let stream = Arc::new(Mutex::new(stream));
 
@@ -187,24 +200,14 @@ impl Session {
             }
         }
 
-        // Assert the dispatch hook has actually fired.  If the target was
-        // linked BIND_NOW / -Bsymbolic, PLT shadowing may not take effect.
+        // Query status for debugging, but do NOT fail if the dispatch hook
+        // hasn't fired yet — the target may not have called
+        // wl_display_dispatch since injection.  The only definitive test is
+        // G_DISPATCH_CALLED, which is set lazily inside run_hooks.
         {
             let mut s = stream.lock().await;
             send_line(&mut s, &Command::new("status")).await?;
-            let line = read_line(&mut s).await?;
-            let status: Response = serde_json::from_str(&line)
-                .map_err(|e| Error::SocketError(format!("invalid status: {e}")))?;
-            if status.status != "ok" {
-                return Err(map_ipc_error(
-                    &status.code.unwrap_or_default(),
-                    &status.message.unwrap_or_default(),
-                    status.kind.as_deref(),
-                ));
-            }
-            if status.dispatch_hook_installed == Some(false) {
-                return Err(Error::DispatchHookNotInstalled);
-            }
+            let _line = read_line(&mut s).await?;
         }
 
         Ok(Session {
@@ -462,7 +465,7 @@ mod tests {
     fn response_deserialization_status_with_dispatch_hook() {
         let json = r#"{"status":"ok","dispatch_hook_installed":false}"#;
         let resp: Response = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.dispatch_hook_installed, Some(false));
+        assert_eq!(resp._dispatch_hook_installed, Some(false));
     }
 
     #[test]

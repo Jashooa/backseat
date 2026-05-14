@@ -3,55 +3,22 @@
 //! This module handles:
 //!
 //! 1. **Process lookup** — scanning `/proc` to resolve a process name to a PID.
-//! 2. **libc resolution** — parsing `/proc/<pid>/maps` and the on-disk ELF to
-//!    find the virtual address of `dlopen` inside the target.
-//! 3. **Shellcode injection** — writing a short x86-64 stub into the target's
-//!    stack that calls `dlopen(payload_path, RTLD_NOW | RTLD_GLOBAL)`.
-//! 4. ** ptrace flow** — attach, save registers, execute stub, read result,
+//! 2. **libc resolution** — reusing the `proc-maps` output to locate libc,
+//!    then parsing the on-disk ELF to find the virtual address of `dlopen`.
+//! 3. **Shellcode injection** — writing a short x86-64 stub into an
+//!    executable region of the target and executing it via ptrace.
+//! 4. **ptrace flow** — attach, save registers, execute stub, read result,
 //!    restore state, detach.
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("backseat only supports x86_64 Linux");
 
-use std::ffi::c_void;
 use std::path::Path;
 
 use goblin::Object;
-use nix::sys::ptrace;
-use nix::sys::signal::Signal;
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::Pid;
+use pete::{Ptracer, Restart, Stop};
 
-use crate::error::{Error, PtraceOp};
-
-// ---------------------------------------------------------------------------
-// Ptrace guard — ensures detach on scope exit unless explicitly defused.
-// ---------------------------------------------------------------------------
-
-struct PtraceGuard {
-    pid: Pid,
-    defused: bool,
-}
-
-impl PtraceGuard {
-    fn new(pid: Pid) -> Self {
-        Self {
-            pid,
-            defused: false,
-        }
-    }
-    fn defuse(&mut self) {
-        self.defused = true;
-    }
-}
-
-impl Drop for PtraceGuard {
-    fn drop(&mut self) {
-        if !self.defused {
-            let _ = ptrace::detach(self.pid, None);
-        }
-    }
-}
+use crate::error::Error;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -61,167 +28,236 @@ impl Drop for PtraceGuard {
 ///
 /// # Overview
 ///
-/// 1. `PTRACE_ATTACH` and wait for `SIGSTOP`.
+/// 1. Attach via `pete::Ptracer` and wait for `SIGSTOP`.
 /// 2. Save all registers.
-/// 3. Resolve `dlopen` address via `/proc/<pid>/maps` + ELF parsing.
-/// 4. Write the payload path and shellcode onto the target stack.
-/// 5. Set `RIP`, `RDI`, `RSI`, `RSP` and `PTRACE_CONT`.
-/// 6. Wait for `SIGTRAP` (the stub ends with `int3`).
-/// 7. Read `RAX` — if zero, `dlopen` failed.
-/// 8. Restore original stack bytes and registers.
-/// 9. `PTRACE_DETACH`.
+/// 3. Find an executable scratch region via `proc-maps`.
+/// 4. Resolve `dlopen` address via ELF parsing.
+/// 5. Write the payload path and shellcode into the scratch region
+///    (`ptrace` writes bypass page permissions).
+/// 6. Set `RIP` to the shellcode and continue.
+/// 7. Wait for `SIGTRAP` (the stub ends with `int3`).
+/// 8. Read `RAX` — if zero, `dlopen` failed.
+/// 9. Restore original bytes and registers, detach.
 ///
 /// # Errors
 ///
 /// Returns structured errors for every failure mode (permission denied,
 /// dlopen returning null, ptrace errors, etc.).
-pub fn inject_payload(pid: u32, payload_path: &Path) -> Result<(), Error> {
-    let pid_nix = Pid::from_raw(pid as i32);
+pub fn inject_payload(pid: u32, payload_path: &Path, socket_path: &str) -> Result<(), Error> {
+    let mut ptracer = Ptracer::new();
 
     // 1. Attach
-    ptrace::attach(pid_nix).map_err(|e| {
-        let errno = errno_from_nix(e);
-        if errno == libc::EPERM {
-            Error::PermissionDenied(pid)
-        } else {
-            Error::PtraceFailed {
-                pid,
-                op: PtraceOp::Attach,
-                errno,
-            }
-        }
-    })?;
+    ptracer
+        .attach(pete::Pid::from_raw(pid as i32))
+        .map_err(|e| Error::PayloadExtractFailed(format!("ptrace attach: {e}")))?;
 
-    let status = waitpid(pid_nix, None).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::Attach,
-        errno: errno_from_nix(e),
-    })?;
-    if !matches!(status, WaitStatus::Stopped(_, Signal::SIGSTOP)) {
+    let tracee = ptracer
+        .wait()
+        .map_err(|e| Error::PayloadExtractFailed(format!("ptrace wait: {e}")))?
+        .ok_or_else(|| Error::PayloadExtractFailed("ptrace attach: no tracee".into()))?;
+
+    // The initial stop after attach is either the explicit SIGSTOP or
+    // pete's `Stop::Attach` variant (depending on kernel / pete version).
+    let got_attach = matches!(
+        tracee.stop,
+        Stop::SignalDelivery { signal } if signal == pete::Signal::SIGSTOP
+    ) || matches!(tracee.stop, Stop::Attach);
+    if !got_attach {
         return Err(Error::UnexpectedWaitStatus {
             pid,
-            op: PtraceOp::Attach,
+            op: crate::error::PtraceOp::Attach,
+            status: format!("{:?}", tracee.stop),
         });
     }
 
-    let mut guard = PtraceGuard::new(pid_nix);
-
     // 2. Save registers
-    let orig_regs = ptrace::getregs(pid_nix).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::GetRegs,
-        errno: errno_from_nix(e),
-    })?;
+    let mut tracee = tracee;
+    let orig_regs = tracee
+        .registers()
+        .map_err(|e| Error::PayloadExtractFailed(format!("getregs: {e}")))?;
 
-    // 3. Resolve dlopen
-    let dlopen_addr = resolve_dlopen(pid)?;
+    // 3. Find an executable scratch region
+    let maps = proc_maps::get_process_maps(pid as i32)
+        .map_err(|e| Error::PayloadExtractFailed(format!("proc_maps: {e}")))?;
 
-    // 4. Write payload path and shellcode to scratch area on stack
-    let path_cstring = std::ffi::CString::new(payload_path.as_os_str().as_encoded_bytes())
+    let scratch = maps
+        .iter()
+        .find(|m| m.is_exec() && m.size() >= 512)
+        .map(|m| {
+            let start = m.start() as u64;
+            // Skip past any function entry point at the very start.
+            start + 0x10
+        })
+        .ok_or_else(|| Error::PayloadExtractFailed("no executable scratch region".into()))?;
+
+    // 4. Resolve dlopen and dlsym (reuse the same parsed maps)
+    let dlopen_addr = resolve_symbol(pid, &maps, "dlopen")
+        .or_else(|| resolve_symbol(pid, &maps, "__libc_dlopen_mode"))
+        .ok_or(Error::LibcResolutionFailed { pid })?;
+    let dlsym_addr = resolve_symbol(pid, &maps, "dlsym")
+        .or_else(|| resolve_symbol(pid, &maps, "__libc_dlsym"))
+        .ok_or(Error::LibcResolutionFailed { pid })?;
+
+    // 5. Write strings and shellcode to scratch area
+    let payload_cstring = std::ffi::CString::new(payload_path.as_os_str().as_encoded_bytes())
         .map_err(|_| Error::PayloadExtractFailed("invalid payload path".into()))?;
-    let path_bytes = path_cstring.as_bytes_with_nul();
+    let payload_bytes = payload_cstring.as_bytes_with_nul();
 
-    // Place scratch area 4 KiB below current RSP (well below the red zone).
-    let scratch = orig_regs.rsp.saturating_sub(0x1000);
-    let path_addr = scratch;
-    let code_addr = scratch + ((path_bytes.len() + 7) & !7) as u64;
+    let socket_cstring = std::ffi::CString::new(socket_path)
+        .map_err(|_| Error::PayloadExtractFailed("invalid socket path".into()))?;
+    let socket_bytes = socket_cstring.as_bytes_with_nul();
 
-    let shellcode = make_shellcode(dlopen_addr, path_addr);
+    let symbol_name = b"backseat_init\0";
+
+    let payload_addr = scratch;
+    let socket_addr = payload_addr + ((payload_bytes.len() + 7) & !7) as u64;
+    let symbol_addr = socket_addr + ((socket_bytes.len() + 7) & !7) as u64;
+    let code_addr = symbol_addr + ((symbol_name.len() + 7) & !7) as u64;
+
+    let shellcode = make_shellcode(
+        dlopen_addr,
+        dlsym_addr,
+        payload_addr,
+        socket_addr,
+        symbol_addr,
+    );
 
     // Remember original bytes so we can restore them later.
-    let orig_path = read_bytes(pid, path_addr, path_bytes.len())?;
-    let orig_code = read_bytes(pid, code_addr, shellcode.len())?;
+    let orig_payload = tracee
+        .read_memory(payload_addr, payload_bytes.len())
+        .map_err(|e| Error::PayloadExtractFailed(format!("read payload bytes: {e}")))?;
+    let orig_socket = tracee
+        .read_memory(socket_addr, socket_bytes.len())
+        .map_err(|e| Error::PayloadExtractFailed(format!("read socket bytes: {e}")))?;
+    let orig_symbol = tracee
+        .read_memory(symbol_addr, symbol_name.len())
+        .map_err(|e| Error::PayloadExtractFailed(format!("read symbol bytes: {e}")))?;
+    let orig_code = tracee
+        .read_memory(code_addr, shellcode.len())
+        .map_err(|e| Error::PayloadExtractFailed(format!("read code bytes: {e}")))?;
 
-    let inject_result: Result<(), Error> = (|| {
-        write_bytes(pid, path_addr, path_bytes)?;
-        write_bytes(pid, code_addr, &shellcode)?;
+    tracee
+        .write_memory(payload_addr, payload_bytes)
+        .map_err(|e| Error::PayloadExtractFailed(format!("write payload bytes: {e}")))?;
+    tracee
+        .write_memory(socket_addr, socket_bytes)
+        .map_err(|e| Error::PayloadExtractFailed(format!("write socket bytes: {e}")))?;
+    tracee
+        .write_memory(symbol_addr, symbol_name)
+        .map_err(|e| Error::PayloadExtractFailed(format!("write symbol bytes: {e}")))?;
+    tracee
+        .write_memory(code_addr, &shellcode)
+        .map_err(|e| Error::PayloadExtractFailed(format!("write shellcode: {e}")))?;
 
-        // 5. Set registers for shellcode execution
-        let mut regs = orig_regs;
-        regs.rip = code_addr;
-        regs.rdi = path_addr;
-        regs.rsi = (libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64;
-        regs.rsp = scratch;
-        ptrace::setregs(pid_nix, regs).map_err(|e| Error::PtraceFailed {
-            pid,
-            op: PtraceOp::SetRegs,
-            errno: errno_from_nix(e),
-        })?;
+    // 6. Set registers for shellcode execution
+    let mut regs = orig_regs;
+    regs.rip = code_addr;
+    regs.rdi = payload_addr;
+    regs.rsi = (libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64;
+    // If the tracee was blocked in a syscall when we attached, the kernel
+    // has saved the return address in the syscall frame.  Clobber orig_rax
+    // so the kernel won't restart the syscall and overwrite our RIP.
+    regs.orig_rax = u64::MAX;
 
-        // 6. Continue until INT3 (SIGTRAP)
-        ptrace::cont(pid_nix, None).map_err(|e| Error::PtraceFailed {
-            pid,
-            op: PtraceOp::Cont,
-            errno: errno_from_nix(e),
-        })?;
+    // Find the stack (or any large writable anonymous mapping) and
+    // place RSP safely inside it.  We must NOT use the executable
+    // scratch region for the stack — it is r-xp, not writable.
+    let stack = maps
+        .iter()
+        .find(|m| {
+            m.is_write()
+                && m.filename()
+                    .is_some_and(|p| p.to_string_lossy().contains("[stack]"))
+        })
+        .or_else(|| {
+            maps.iter()
+                .find(|m| m.is_write() && m.filename().is_none() && m.size() >= 0x1000)
+        })
+        .ok_or_else(|| Error::PayloadExtractFailed("no writable stack region".into()))?;
 
-        let status = waitpid(pid_nix, None).map_err(|e| Error::PtraceFailed {
-            pid,
-            op: PtraceOp::Cont,
-            errno: errno_from_nix(e),
-        })?;
-        if !matches!(status, WaitStatus::Stopped(_, Signal::SIGTRAP)) {
-            return Err(Error::UnexpectedWaitStatus {
-                pid,
-                op: PtraceOp::Cont,
-            });
+    let stack_top = (stack.start() + stack.size()) as u64;
+    // Place RSP well inside the mapping but with ample headroom for the
+    // shellcode's call frames, dlopen, constructors, and pthread_create.
+    regs.rsp = stack_top.saturating_sub(0x10000);
+
+    tracee
+        .set_registers(regs)
+        .map_err(|e| Error::PayloadExtractFailed(format!("setregs: {e}")))?;
+
+    // 7. Continue until INT3 (SIGTRAP)
+    ptracer
+        .restart(tracee, Restart::Continue)
+        .map_err(|e| Error::PayloadExtractFailed(format!("cont: {e}")))?;
+
+    let tracee = ptracer
+        .wait()
+        .map_err(|e| Error::PayloadExtractFailed(format!("wait after cont: {e}")))?
+        .ok_or_else(|| Error::PayloadExtractFailed("no tracee after cont".into()))?;
+
+    // Check for SIGSEGV first — gives us the faulting RIP for debugging.
+    if let Stop::SignalDelivery { signal } = tracee.stop {
+        if signal == pete::Signal::SIGSEGV {
+            let fault_regs = tracee
+                .registers()
+                .map_err(|e| Error::PayloadExtractFailed(format!("getregs after segfault: {e}")))?;
+            return Err(Error::PayloadExtractFailed(format!(
+                "SIGSEGV at RIP={:#x} (dlopen={:#x} dlsym={:#x} payload={:#x} socket={:#x} symbol={:#x} code={:#x})",
+                fault_regs.rip, dlopen_addr, dlsym_addr, payload_addr, socket_addr, symbol_addr, code_addr
+            )));
         }
-
-        // 7. Read RAX (dlopen handle)
-        let post_regs = ptrace::getregs(pid_nix).map_err(|e| Error::PtraceFailed {
-            pid,
-            op: PtraceOp::GetRegs,
-            errno: errno_from_nix(e),
-        })?;
-        if post_regs.rax == 0 {
-            return Err(Error::DlopenReturnedNull { pid });
-        }
-
-        // 8. Restore original bytes and registers
-        write_bytes(pid, path_addr, &orig_path)?;
-        write_bytes(pid, code_addr, &orig_code)?;
-        ptrace::setregs(pid_nix, orig_regs).map_err(|e| Error::PtraceFailed {
-            pid,
-            op: PtraceOp::SetRegs,
-            errno: errno_from_nix(e),
-        })?;
-
-        Ok(())
-    })();
-
-    if inject_result.is_err() {
-        // Best-effort restore of stack bytes so the target isn't left
-        // with shellcode or path data on its stack.
-        let _ = write_bytes(pid, path_addr, &orig_path);
-        let _ = write_bytes(pid, code_addr, &orig_code);
-        let _ = ptrace::setregs(pid_nix, orig_regs);
     }
 
-    // 9. Detach
-    guard.defuse();
-    ptrace::detach(pid_nix, None).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::Detach,
-        errno: errno_from_nix(e),
+    let got_trap = matches!(
+        tracee.stop,
+        Stop::SignalDelivery { signal } if signal == pete::Signal::SIGTRAP
+    );
+    if !got_trap {
+        return Err(Error::UnexpectedWaitStatus {
+            pid,
+            op: crate::error::PtraceOp::Cont,
+            status: format!("{:?}", tracee.stop),
+        });
+    }
+
+    // 8. Read RBX (dlopen handle was saved there by the shellcode)
+    let mut tracee = tracee;
+    let post_regs = tracee
+        .registers()
+        .map_err(|e| Error::PayloadExtractFailed(format!("getregs after trap: {e}")))?;
+    if post_regs.rbx == 0 {
+        return Err(Error::DlopenReturnedNull { pid });
+    }
+
+    // 9. Restore original bytes and registers
+    tracee
+        .write_memory(payload_addr, &orig_payload)
+        .map_err(|e| Error::PayloadExtractFailed(format!("restore payload bytes: {e}")))?;
+    tracee
+        .write_memory(socket_addr, &orig_socket)
+        .map_err(|e| Error::PayloadExtractFailed(format!("restore socket bytes: {e}")))?;
+    tracee
+        .write_memory(symbol_addr, &orig_symbol)
+        .map_err(|e| Error::PayloadExtractFailed(format!("restore symbol bytes: {e}")))?;
+    tracee
+        .write_memory(code_addr, &orig_code)
+        .map_err(|e| Error::PayloadExtractFailed(format!("restore code: {e}")))?;
+    tracee
+        .set_registers(orig_regs)
+        .map_err(|e| Error::PayloadExtractFailed(format!("restore regs: {e}")))?;
+
+    // 10. Detach — pete doesn't expose Restart::Detach, so use nix directly.
+    nix::sys::ptrace::detach(nix::unistd::Pid::from_raw(pid as i32), None).map_err(|e| {
+        Error::PtraceFailed {
+            pid,
+            op: crate::error::PtraceOp::Detach,
+            errno: e as i32,
+        }
     })?;
 
-    inject_result
+    Ok(())
 }
 
 /// Resolve a human-readable process name to a PID by scanning `/proc`.
-///
-/// Matching order:
-/// 1. `/proc/<pid>/comm` (kernel task name, truncated to 15 bytes).
-/// 2. Basename of `/proc/<pid>/cmdline` field 0.
-///
-/// If more than one process matches, returns
-/// [`Error::AmbiguousProcessName`](crate::Error::AmbiguousProcessName).
-///
-/// # Caveat
-///
-/// PID reuse between resolution and `ptrace::attach` is possible.  Callers
-/// requiring stronger guarantees should use `pidfd_open` (Linux 5.3+) or
-/// re-verify `/proc/<pid>/comm` after attach succeeds.
 pub fn from_name(name: &str) -> Result<u32, Error> {
     let mut matches = Vec::new();
     let proc = std::fs::read_dir("/proc")
@@ -239,7 +275,7 @@ pub fn from_name(name: &str) -> Result<u32, Error> {
             let comm = comm.trim_end();
             if comm == name {
                 matches.push(pid);
-                continue;
+                continue; // skip cmdline check — don't double-push
             }
         }
         let cmdline_path = format!("/proc/{}/cmdline", pid);
@@ -255,6 +291,9 @@ pub fn from_name(name: &str) -> Result<u32, Error> {
             }
         }
     }
+
+    matches.sort_unstable();
+
     match matches.len() {
         0 => Err(Error::ProcessNotFound(name.to_string())),
         1 => Ok(matches[0]),
@@ -269,89 +308,37 @@ pub fn from_name(name: &str) -> Result<u32, Error> {
 // libc / dlopen resolution
 // ---------------------------------------------------------------------------
 
-/// Find the virtual address of `dlopen` inside `pid`.
+/// Find the virtual address of a symbol inside `pid`'s libc mapping.
 ///
 /// Steps:
-/// 1. Parse `/proc/<pid>/maps` to locate the libc mapping.
+/// 1. Reuse the `proc_maps::MapRange` vec to locate the libc mapping.
 /// 2. Read the on-disk libc binary.
-/// 3. Parse ELF dynamic symbol table (`.dynsym`) for `dlopen` or
-///    `__libc_dlopen_mode`.
+/// 3. Parse ELF dynamic symbol table (`.dynsym`) for the symbol.
 /// 4. Walk program headers to translate the symbol's virtual address to a
-///    file offset (not architecturally guaranteed to equal `st_value`).
+///    file offset.
 /// 5. Compute `target_base + symbol_vaddr`.
-/// 6. Verify by `PTRACE_PEEKTEXT` — read a word at the computed address and
-///    compare with the on-disk bytes.
-fn resolve_dlopen(pid: u32) -> Result<u64, Error> {
-    let (base, path) = find_libc_mapping(pid)?;
-    let data =
-        std::fs::read(&path).map_err(|e| Error::PayloadExtractFailed(format!("read libc: {e}")))?;
-
-    let (sym_vaddr, file_offset) = find_symbol_offset(&data, "dlopen")
-        .or_else(|| find_symbol_offset(&data, "__libc_dlopen_mode"))
-        .ok_or(Error::LibcResolutionFailed { pid })?;
-
-    let addr = base + sym_vaddr;
-
-    // Verify by peeking a few bytes at the computed address.
-    let pid_nix = Pid::from_raw(pid as i32);
-    let word = ptrace::read(pid_nix, addr as *mut c_void).map_err(|e| Error::PtraceFailed {
-        pid,
-        op: PtraceOp::PokeData,
-        errno: errno_from_nix(e),
-    })? as u64;
-    let off = file_offset as usize;
-    let disk_bytes = &data[off..off.saturating_add(8).min(data.len())];
-    if disk_bytes.len() < 8 {
-        return Err(Error::LibcResolutionFailed { pid });
-    }
-    let disk_word = u64::from_le_bytes([
-        disk_bytes[0],
-        disk_bytes[1],
-        disk_bytes[2],
-        disk_bytes[3],
-        disk_bytes[4],
-        disk_bytes[5],
-        disk_bytes[6],
-        disk_bytes[7],
-    ]);
-    if word != disk_word {
-        return Err(Error::LibcResolutionFailed { pid });
-    }
-
-    Ok(addr)
-}
-
-/// Scan `/proc/<pid>/maps` for a line that looks like libc.
-fn find_libc_mapping(pid: u32) -> Result<(u64, String), Error> {
-    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid))
-        .map_err(|e| Error::PayloadExtractFailed(format!("read maps: {e}")))?;
-    find_libc_mapping_in(&maps, pid)
-}
-
-/// Parse a `/proc/<pid>/maps` string and return the first libc mapping.
-fn find_libc_mapping_in(maps: &str, pid: u32) -> Result<(u64, String), Error> {
-    for line in maps.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
+fn resolve_symbol(_pid: u32, maps: &[proc_maps::MapRange], name: &str) -> Option<u64> {
+    let map = maps.iter().find(|m| {
+        if let Some(path) = m.filename() {
+            let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_libc = basename.starts_with("libc.so")
+                || basename.starts_with("libc-")
+                || basename.starts_with("libc.musl-");
+            let is_musl = basename.starts_with("ld-musl-");
+            let path_str = path.to_string_lossy();
+            (is_libc || is_musl) && (path_str.ends_with(".so") || path_str.contains(".so."))
+        } else {
+            false
         }
-        let path = parts[5];
-        let basename = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(path);
-        let is_libc = basename.starts_with("libc.so")
-            || basename.starts_with("libc-")
-            || basename.starts_with("libc.musl-");
-        let is_musl = basename.starts_with("ld-musl-");
-        if (is_libc || is_musl) && (path.ends_with(".so") || path.contains(".so.")) {
-            let addr_str = parts[0].split('-').next().unwrap_or("");
-            let base = u64::from_str_radix(addr_str, 16)
-                .map_err(|_| Error::LibcResolutionFailed { pid })?;
-            return Ok((base, path.to_string()));
-        }
-    }
-    Err(Error::LibcResolutionFailed { pid })
+    })?;
+
+    let base = map.start() as u64;
+    let path = map.filename().unwrap().to_path_buf();
+
+    let data = std::fs::read(&path).ok()?;
+    let (sym_vaddr, _file_offset) = find_symbol_offset(&data, name)?;
+
+    Some(base + sym_vaddr)
 }
 
 /// Translate a virtual address to a file offset using ELF program headers.
@@ -397,26 +384,55 @@ fn find_symbol_offset(data: &[u8], name: &str) -> Option<(u64, u64)> {
 // Shellcode
 // ---------------------------------------------------------------------------
 
-/// Assemble a 33-byte x86-64 stub that:
+/// Assemble an x86-64 stub that:
 ///
 /// ```asm
-/// movabs rdi, <path_addr>
+/// movabs rdi, <payload_path_addr>
 /// movabs rsi, RTLD_NOW | RTLD_GLOBAL
 /// movabs rax, <dlopen_addr>
-/// call rax
+/// call rax              ; rax = handle
+/// mov rbx, rax          ; save handle
+/// movabs rdi, <symbol_name_addr>
+/// movabs rax, <dlsym_addr>
+/// call rax              ; rax = backseat_init addr
+/// movabs rdi, <socket_path_addr>
+/// call rax              ; backseat_init(socket_path)
 /// int3
 /// ```
-fn make_shellcode(dlopen_addr: u64, path_addr: u64) -> Vec<u8> {
-    let mut code = Vec::with_capacity(33);
-    // movabs rdi, path_addr
+fn make_shellcode(
+    dlopen_addr: u64,
+    dlsym_addr: u64,
+    payload_path_addr: u64,
+    socket_path_addr: u64,
+    symbol_name_addr: u64,
+) -> Vec<u8> {
+    let mut code = Vec::with_capacity(80);
+    // movabs rdi, payload_path_addr
     code.extend_from_slice(&[0x48, 0xBF]);
-    code.extend_from_slice(&path_addr.to_le_bytes());
-    // movabs rsi, RTLD_NOW | RTLD_GLOBAL
+    code.extend_from_slice(&payload_path_addr.to_le_bytes());
+    // movabs rsi, RTLD_NOW
     code.extend_from_slice(&[0x48, 0xBE]);
-    code.extend_from_slice(&((libc::RTLD_NOW | libc::RTLD_GLOBAL) as u64).to_le_bytes());
+    code.extend_from_slice(&(libc::RTLD_NOW as u64).to_le_bytes());
     // movabs rax, dlopen_addr
     code.extend_from_slice(&[0x48, 0xB8]);
     code.extend_from_slice(&dlopen_addr.to_le_bytes());
+    // call rax
+    code.extend_from_slice(&[0xFF, 0xD0]);
+    // mov rbx, rax
+    code.extend_from_slice(&[0x48, 0x89, 0xC3]);
+    // mov rdi, rbx
+    code.extend_from_slice(&[0x48, 0x89, 0xDF]);
+    // movabs rsi, symbol_name_addr
+    code.extend_from_slice(&[0x48, 0xBE]);
+    code.extend_from_slice(&symbol_name_addr.to_le_bytes());
+    // movabs rax, dlsym_addr
+    code.extend_from_slice(&[0x48, 0xB8]);
+    code.extend_from_slice(&dlsym_addr.to_le_bytes());
+    // call rax
+    code.extend_from_slice(&[0xFF, 0xD0]);
+    // movabs rdi, socket_path_addr
+    code.extend_from_slice(&[0x48, 0xBF]);
+    code.extend_from_slice(&socket_path_addr.to_le_bytes());
     // call rax
     code.extend_from_slice(&[0xFF, 0xD0]);
     // int3
@@ -425,87 +441,8 @@ fn make_shellcode(dlopen_addr: u64, path_addr: u64) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level ptrace helpers
+// Tests
 // ---------------------------------------------------------------------------
-
-/// Read `len` bytes from the target process at `addr` via `PTRACE_PEEKDATA`.
-fn read_bytes(pid: u32, addr: u64, len: usize) -> Result<Vec<u8>, Error> {
-    let pid_nix = Pid::from_raw(pid as i32);
-    let mut bytes = Vec::with_capacity(len);
-    for i in 0..len.div_ceil(8) {
-        let word = ptrace::read(pid_nix, (addr + (i * 8) as u64) as *mut c_void).map_err(|e| {
-            Error::PtraceFailed {
-                pid,
-                op: PtraceOp::PokeData,
-                errno: errno_from_nix(e),
-            }
-        })? as u64;
-        let chunk_len = std::cmp::min(8, len - i * 8);
-        for j in 0..chunk_len {
-            bytes.push((word >> (j * 8)) as u8);
-        }
-    }
-    Ok(bytes)
-}
-
-/// Write `bytes` into the target process at `addr` via `PTRACE_POKEDATA`.
-///
-/// For the final partial chunk a read-modify-write is performed so that
-/// trailing bytes of the target word are preserved.
-fn write_bytes(pid: u32, addr: u64, bytes: &[u8]) -> Result<(), Error> {
-    let pid_nix = Pid::from_raw(pid as i32);
-    for (i, chunk) in bytes.chunks(8).enumerate() {
-        let target_addr = addr + (i * 8) as u64;
-        let word = if chunk.len() == 8 {
-            // Full word — just pack the bytes.
-            pack_word(chunk)
-        } else {
-            // Partial word — read-modify-write to preserve trailing bytes.
-            let existing = ptrace::read(pid_nix, target_addr as *mut c_void).map_err(|e| {
-                Error::ShellcodeWriteFailed {
-                    pid,
-                    addr: target_addr,
-                    errno: errno_from_nix(e),
-                }
-            })? as u64;
-            pack_partial_word(existing, chunk)
-        };
-        ptrace::write(pid_nix, target_addr as *mut c_void, word as i64).map_err(|e| {
-            Error::ShellcodeWriteFailed {
-                pid,
-                addr: target_addr,
-                errno: errno_from_nix(e),
-            }
-        })?;
-    }
-    Ok(())
-}
-
-/// Convert a nix error to a raw `errno` integer.
-fn errno_from_nix(e: nix::Error) -> i32 {
-    // nix::Error is a type alias for nix::errno::Errno.
-    e as i32
-}
-
-/// Pack 8 bytes into a little-endian `u64`.
-fn pack_word(chunk: &[u8]) -> u64 {
-    assert_eq!(chunk.len(), 8);
-    let mut w: u64 = 0;
-    for (j, &b) in chunk.iter().enumerate() {
-        w |= (b as u64) << (j * 8);
-    }
-    w
-}
-
-/// Merge `chunk` into the low bytes of `existing`, preserving the rest.
-fn pack_partial_word(existing: u64, chunk: &[u8]) -> u64 {
-    let mut w = existing;
-    for (j, &b) in chunk.iter().enumerate() {
-        let mask = 0xFFu64 << (j * 8);
-        w = (w & !mask) | ((b as u64) << (j * 8));
-    }
-    w
-}
 
 #[cfg(test)]
 mod tests {
@@ -513,8 +450,8 @@ mod tests {
 
     #[test]
     fn shellcode_size() {
-        let sc = make_shellcode(0x1234, 0x5678);
-        assert_eq!(sc.len(), 33);
+        let sc = make_shellcode(0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111);
+        assert_eq!(sc.len(), 73);
     }
 
     #[test]
@@ -523,29 +460,8 @@ mod tests {
     }
 
     #[test]
-    fn pack_partial_word_preserves_trailing() {
-        let existing = u64::from_le_bytes([0xAA; 8]);
-        let result = pack_partial_word(existing, &[0x01, 0x02, 0x03]);
-        assert_eq!(
-            result.to_le_bytes(),
-            [0x01, 0x02, 0x03, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]
-        );
-    }
-
-    #[test]
-    fn find_libc_mapping_rejects_libcaca() {
-        let maps = "7f8b0000-7f8b1000 r-xp 00000000 00:00 0                          /usr/lib/libcaca.so\n\
-                    7f8b1000-7f8b2000 r-xp 00000000 00:00 0                          /usr/lib/libc.so.6\n";
-        let result = find_libc_mapping_in(maps, 1234);
-        assert!(result.is_ok());
-        let (_, path) = result.unwrap();
-        assert!(path.ends_with("libc.so.6"), "got: {}", path);
-    }
-
-    #[test]
     fn vaddr_to_file_offset_hits_and_misses() {
         use goblin::elf::program_header::ProgramHeader;
-        // PT_LOAD covering vaddr 0x1000..0x2000, file offset 0x0
         let ph = ProgramHeader {
             p_type: goblin::elf::program_header::PT_LOAD,
             p_flags: goblin::elf::program_header::PF_R | goblin::elf::program_header::PF_X,
@@ -556,7 +472,6 @@ mod tests {
             p_memsz: 0x1000,
             p_align: 0x1000,
         };
-        // vaddr inside the segment -> translates to file offset
         assert_eq!(
             vaddr_to_file_offset(std::slice::from_ref(&ph), 0x1004),
             Some(0x4)
@@ -565,9 +480,7 @@ mod tests {
             vaddr_to_file_offset(std::slice::from_ref(&ph), 0x1FFF),
             Some(0xFFF)
         );
-        // vaddr below the segment -> None
         assert_eq!(vaddr_to_file_offset(std::slice::from_ref(&ph), 0x0), None);
-        // vaddr at the exact upper bound -> None (half-open interval)
         assert_eq!(
             vaddr_to_file_offset(std::slice::from_ref(&ph), 0x2000),
             None
@@ -576,11 +489,6 @@ mod tests {
 
     #[test]
     fn find_symbol_offset_rejects_uncovered_vaddr() {
-        // A real ELF may have a symbol whose st_value is not covered by any
-        // PT_LOAD.  Since constructing a hand-rolled ELF with a dynsym is
-        // complex, we test the lower-level vaddr_to_file_offset helper above
-        // and simply verify that find_symbol_offset returns None for an ELF
-        // that has no matching symbol name.
         let mut data = Vec::new();
         data.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
         data.extend_from_slice(&[0u8; 8]);
@@ -609,17 +517,5 @@ mod tests {
             data.push(0);
         }
         assert!(find_symbol_offset(&data, "dlopen").is_none());
-    }
-
-    #[test]
-    fn errno_from_nix_roundtrip() {
-        // nix::Error is a repr(i32) enum where the discriminant equals the
-        // errno value.  This test guards against a future nix bump that
-        // changes the representation and silently misreports errnos.
-        assert_eq!(errno_from_nix(nix::Error::EPERM), libc::EPERM);
-        assert_eq!(errno_from_nix(nix::Error::ESRCH), libc::ESRCH);
-        assert_eq!(errno_from_nix(nix::Error::EACCES), libc::EACCES);
-        assert_eq!(errno_from_nix(nix::Error::EINVAL), libc::EINVAL);
-        assert_eq!(errno_from_nix(nix::Error::EIO), libc::EIO);
     }
 }
