@@ -22,6 +22,20 @@ use std::sync::Mutex;
 // ---------------------------------------------------------------------------
 // libwayland internal structures (ABI-stable across libwayland 1.x)
 // ---------------------------------------------------------------------------
+//
+// These mirrors are validated at compile time via offset_of! assertions.
+// A distro libwayland bump that changes any of these layouts will be caught
+// as a build error rather than a silent runtime corruption.
+
+// Compile-time layout assertions — catch ABI drift before it becomes a
+// runtime segfault.
+const _: () = assert!(core::mem::offset_of!(wl_proxy, object) == 0);
+const _: () = assert!(core::mem::offset_of!(wl_proxy, queue) == 32);
+const _: () = assert!(core::mem::offset_of!(wl_proxy, queue_link) == 80);
+const _: () = assert!(core::mem::size_of::<wl_proxy>() == 96);
+const _: () = assert!(core::mem::offset_of!(wl_event_queue, proxy_list) == 16);
+const _: () = assert!(core::mem::offset_of!(wl_display_header, objects) == 144);
+const _: () = assert!(core::mem::size_of::<wl_map>() == 56);
 
 #[repr(C)]
 struct wl_list {
@@ -290,7 +304,7 @@ unsafe fn sweep_event_queues() {
     while cur != head && !cur.is_null() {
         // The proxy is embedded inside wl_proxy.queue_link — offset
         // back to the start of the wl_proxy struct.
-        let link_offset = 80usize;
+        let link_offset = core::mem::offset_of!(wl_proxy, queue_link);
         let proxy = (cur as usize - link_offset) as *mut c_void;
         capture_proxy(proxy);
         cur = (*cur).next;
@@ -955,12 +969,36 @@ fn ipc_thread() {
 // Constructor
 // ---------------------------------------------------------------------------
 
+/// Set to true if the runtime libwayland probe fails.  When set, the IPC
+/// thread will not start and backseat_init will refuse subsequent injections.
+static PROBE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Runtime probe — verify the target's libwayland ABI matches our layout
+/// expectations before we start patching memory.
+unsafe fn probe_libwayland() -> bool {
+    // dlsym for a symbol that has existed in all libwayland 1.x releases.
+    // RTLD_DEFAULT searches the global symbol table (libwayland must be
+    // loaded for the target to be a Wayland client).
+    let sym = libc::dlsym(
+        libc::RTLD_DEFAULT,
+        c"wl_proxy_get_version".as_ptr() as *const c_char,
+    );
+    if sym.is_null() {
+        return false;
+    }
+    true
+}
+
 #[used]
 #[link_section = ".init_array"]
 static CONSTRUCTOR: extern "C" fn() = init;
 
 extern "C" fn init() {
     unsafe {
+        if !probe_libwayland() {
+            PROBE_FAILED.store(true, Ordering::Release);
+            return;
+        }
         patch_all_gots("wl_display_dispatch", hook_dispatch as *mut c_void);
         patch_all_gots(
             "wl_display_dispatch_pending",
@@ -1004,6 +1042,10 @@ pub unsafe extern "C" fn backseat_init(path: *const c_char) {
     extern "C" fn ipc_thread_wrapper(_arg: *mut c_void) -> *mut c_void {
         ipc_thread();
         std::ptr::null_mut()
+    }
+
+    if PROBE_FAILED.load(Ordering::Acquire) {
+        return;
     }
 
     if IPC_THREAD_STARTED

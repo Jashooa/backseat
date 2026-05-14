@@ -77,6 +77,11 @@ pub enum Error {
     #[error("ptrace_scope is {current} (need 0 to trace arbitrary processes)")]
     PtraceScopeRestricted { current: u32 },
 
+    /// The target's libwayland version is incompatible with the payload's
+    /// hard-coded struct layouts.  The probe describes what was checked.
+    #[error("incompatible libwayland (probe: {probe})")]
+    IncompatibleLibwayland { probe: String },
+
     /// `waitpid` returned an unexpected status during ptrace flow.
     #[error("unexpected wait status during {op:?} for PID {pid}: {status}")]
     UnexpectedWaitStatus {
@@ -233,6 +238,12 @@ mod tests {
             (
                 "PtraceScopeRestricted",
                 Error::PtraceScopeRestricted { current: 1 },
+            ),
+            (
+                "IncompatibleLibwayland",
+                Error::IncompatibleLibwayland {
+                    probe: "offset check".into(),
+                },
             ),
         ];
         for (name, err) in errors {
