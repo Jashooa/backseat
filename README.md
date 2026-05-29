@@ -170,15 +170,16 @@ and no attempt is made to conceal the injection.
   The payload does not install `pthread_atfork` handlers to recover.
 - PID reuse is possible (but unlikely) between `Session::from_name` resolution
   and `ptrace::attach`.  Use `Session::new(pid)` when stability is critical.
-- Dispatcher-style proxies (`wl_proxy_add_dispatcher`, used by `wayland-rs`
-  v0.31+, winit, iced, COSMIC, etc.) require the target to link against the
-  C `libwayland-client` (the `system` / `client_system` feature in
-  `wayland-backend`).  If the target uses a pure-Rust Wayland backend (the
-  default when `default-features = false` is set without an explicit
-  `features = ["system"]`), keyboard and mouse injection silently does
-  nothing — the payload can't find the input proxies.
-- `surface_size()` is unavailable for dispatcher-proxy clients — the toplevel
-  shim cannot be installed without corrupting the backend's sentinel static.
+- Both **dispatcher-style** (`wl_proxy_add_dispatcher`, used by `wayland-rs`,
+  winit, iced, COSMIC) and **listener-style** (`wl_proxy_add_listener`, used
+  by GTK, Qt, SDL, and raw C Wayland clients) input proxies are supported.
+  Synthetic input is delivered through the appropriate path for each
+  proxy style.  The target must link against the C `libwayland-client`
+  (the `system` / `client_system` feature in `wayland-backend` for Rust
+  apps).  Pure-Rust backends without C `libwayland-client` are unsupported.
+- `surface_size()` requires an `xdg_toplevel` proxy via listener-style
+  registration.  For dispatcher-proxy clients, the toplevel shim cannot
+  be installed without corrupting the backend's sentinel static.
 
 ## Development
 
@@ -197,16 +198,17 @@ make test-all     # test entire workspace
 make integration  # integration tests (requires Wayland + ptrace)
 ```
 
-Integration tests require `weston` (headless compositor) and
-`ptrace_scope = 0`.  They are **not** run in CI (GitHub Actions lacks
-a working compositor).  Run them locally when touching the injection
-engine:
+Integration tests require `weston` (headless compositor).  They are
+**not** run in CI (GitHub Actions lacks a working compositor).  Run
+them locally when touching the injection engine:
 
 ```bash
 sudo apt-get install weston libwayland-dev
-echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
 cargo test --features fixture
 ```
+
+The test fixture uses `PR_SET_PTRACER_ANY` so tests work under the
+default `ptrace_scope = 1` — no kernel configuration changes needed.
 
 The compositor is started with `--fake-seat --no-outputs` so that input
 proxies (wl_pointer, wl_keyboard) are available even in headless mode.
