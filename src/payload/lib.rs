@@ -253,12 +253,27 @@ extern "C" fn toplevel_configure_shim(
 
 
 unsafe fn initial_sweep(display: *mut c_void) {
-    // TODO: the wl_map may contain stale entries from temporary
-    // Wayland objects (e.g. wl_display.sync callbacks).  Walking
-    // those entries dereferences freed proxy memory → SIGSEGV.
-    // The long-term fix is to run a roundtrip (using the unhooked
-    // wl_display_roundtrip) before the sweep, or use a memory-probe
-    // technique.  For now, initial_sweep is a best-effort walk.
+    // Run a roundtrip to let libwayland drain any pending sync
+    // callbacks.  wl_display.sync creates temporary proxy objects
+    // whose entries survive in the wl_map until the callback fires
+    // and the object is destroyed — walking those stale entries
+    // would dereference freed heap memory (triggering strlen on a
+    // garbage interface name → SIGSEGV).
+    //
+    // G_INITIAL_SWEEP_DONE is already set to true by run_hooks
+    // before calling us, so nested dispatch hooks from this roundtrip
+    // will re-enter run_hooks, see DONE=true, and return immediately
+    // — no recursion.
+    let roundtrip: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"wl_display_roundtrip".as_ptr() as *const c_char,
+        ),
+    );
+    if roundtrip as usize != 0 {
+        roundtrip(display);
+    }
+
     let d = display as *mut wl_display_header;
     let map = &(*d).objects;
     let entries = map.client_entries.data as *const usize;
