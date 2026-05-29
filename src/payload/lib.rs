@@ -139,6 +139,7 @@ static REAL_DISPATCH_PENDING: AtomicUsize = AtomicUsize::new(0);
 static REAL_DISPATCH_QUEUE: AtomicUsize = AtomicUsize::new(0);
 static REAL_DISPATCH_QUEUE_PENDING: AtomicUsize = AtomicUsize::new(0);
 static REAL_ADD_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
+static REAL_ADD_LISTENER: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-toplevel saved listener state: `(toplevel_addr, orig_func, orig_data)`.
 static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -167,6 +168,7 @@ fn store_real(symbol: &str, ptr: *mut c_void) {
         "wl_display_dispatch_queue" => &REAL_DISPATCH_QUEUE,
         "wl_display_dispatch_queue_pending" => &REAL_DISPATCH_QUEUE_PENDING,
         "wl_proxy_add_dispatcher" => &REAL_ADD_DISPATCHER,
+        "wl_proxy_add_listener" => &REAL_ADD_LISTENER,
         _ => return,
     };
     target.store(ptr as usize, Ordering::SeqCst);
@@ -384,6 +386,20 @@ unsafe extern "C" fn hook_add_dispatcher(
     let real: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) =
         std::mem::transmute(REAL_ADD_DISPATCHER.load(Ordering::SeqCst));
     real(proxy, dispatcher, implementation, data);
+}
+
+/// Hook installed on `wl_proxy_add_listener`.  Captures listener-style
+/// input proxies (pointer, keyboard, seat, xdg_toplevel) so we can later
+/// deliver synthetic input via `invoke_listener`.
+unsafe extern "C" fn hook_add_listener(
+    proxy: *mut c_void,
+    implementation: *const c_void,
+    data: *mut c_void,
+) -> c_int {
+    capture_proxy(proxy);
+    let real: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int =
+        std::mem::transmute(REAL_ADD_LISTENER.load(Ordering::SeqCst));
+    real(proxy, implementation, data)
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1067,10 @@ extern "C" fn init() {
         patch_all_gots(
             "wl_proxy_add_dispatcher",
             hook_add_dispatcher as *mut c_void,
+        );
+        patch_all_gots(
+            "wl_proxy_add_listener",
+            hook_add_listener as *mut c_void,
         );
     }
 }
