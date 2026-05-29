@@ -28,7 +28,5 @@ int main(int argc, char **argv)
     if (connect_and_bind(&state) != 0)
         return 1;
 
-    register_static_listeners(&state);
-
     return run_loop(&state);
 }

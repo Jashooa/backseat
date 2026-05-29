@@ -53,7 +53,6 @@ int  connect_and_bind(struct app_state *s);
 void request_input_proxies(struct app_state *s);
 void try_create_surface(struct app_state *s);
 void register_input_proxies(struct app_state *s);
-void register_static_listeners(struct app_state *s);
 
 // ---------------------------------------------------------------------------
 // Event output (byte-identical to the Rust fixture)

@@ -32,6 +32,17 @@ void allow_same_uid_ptrace(void)
 }
 
 // ---------------------------------------------------------------------------
+// Forward declarations of listener tables (defined later in this file).
+// They are used by registry_global / try_create_surface before the full
+// struct definitions appear.
+// ---------------------------------------------------------------------------
+
+extern const struct xdg_wm_base_listener xdg_wm_base_listener;
+extern const struct xdg_surface_listener xdg_surface_listener;
+extern const struct xdg_toplevel_listener xdg_toplevel_listener;
+extern const struct wl_seat_listener seat_listener;
+
+// ---------------------------------------------------------------------------
 // Event output — flush after every line so the test harness reads without
 // buffering delays.  Format must be byte-identical to the Rust fixture.
 // ---------------------------------------------------------------------------
@@ -63,11 +74,13 @@ static void registry_global(void *data,
         s->wm_base = wl_registry_bind(registry, name,
                                       &xdg_wm_base_interface,
                                       version < 1 ? version : 1);
+        xdg_wm_base_add_listener(s->wm_base, &xdg_wm_base_listener, s);
         try_create_surface(s);
     } else if (strcmp(interface, "wl_seat") == 0) {
         s->seat = wl_registry_bind(registry, name,
                                    &wl_seat_interface,
                                    version < 5 ? version : 5);
+        wl_seat_add_listener(s->seat, &seat_listener, NULL);
         request_input_proxies(s);
     }
 }
@@ -96,6 +109,10 @@ int connect_and_bind(struct app_state *s)
 
     s->registry = wl_display_get_registry(s->display);
     wl_registry_add_listener(s->registry, &registry_listener, s);
+
+    // Roundtrip: send bind requests and process registry globals so
+    // that compositor / wm_base / seat / surface / toplevel proxies
+    // exist.  After this, callers can register listeners on them.
     wl_display_roundtrip(s->display);
     return 0;
 }
@@ -138,6 +155,11 @@ void try_create_surface(struct app_state *s)
     s->xdg_surface = xdg_wm_base_get_xdg_surface(s->wm_base, s->surface);
     s->toplevel = xdg_surface_get_toplevel(s->xdg_surface);
 
+    // Register listeners immediately so we catch the configure event
+    // that arrives during the next roundtrip / dispatch.
+    xdg_surface_add_listener(s->xdg_surface, &xdg_surface_listener, s);
+    xdg_toplevel_add_listener(s->toplevel, &xdg_toplevel_listener, s);
+
     xdg_toplevel_set_title(s->toplevel, "backseat-test-fixture-c");
     wl_surface_commit(s->surface);
 }
@@ -154,7 +176,7 @@ static void xdg_wm_base_ping(void *data,
     xdg_wm_base_pong(wm_base, serial);
 }
 
-static const struct xdg_wm_base_listener xdg_wm_base_listener = {
+const struct xdg_wm_base_listener xdg_wm_base_listener = {
     .ping = xdg_wm_base_ping,
 };
 
@@ -174,7 +196,7 @@ static void xdg_surface_configure(void *data,
         wl_surface_commit(s->surface);
 }
 
-static const struct xdg_surface_listener xdg_surface_listener = {
+const struct xdg_surface_listener xdg_surface_listener = {
     .configure = xdg_surface_configure,
 };
 
@@ -203,7 +225,7 @@ static void xdg_toplevel_close(void *data,
     should_exit = 1;
 }
 
-static const struct xdg_toplevel_listener xdg_toplevel_listener = {
+const struct xdg_toplevel_listener xdg_toplevel_listener = {
     .configure      = xdg_toplevel_configure,
     .close          = xdg_toplevel_close,
 };
@@ -230,7 +252,7 @@ static void seat_name(void *data,
     (void)name;
 }
 
-static const struct wl_seat_listener seat_listener = {
+const struct wl_seat_listener seat_listener = {
     .capabilities = seat_capabilities,
     .name         = seat_name,
 };
@@ -489,19 +511,6 @@ void register_input_proxies(struct app_state *s)
                                 input_dispatcher,
                                 NULL, s);
     }
-}
-
-void register_static_listeners(struct app_state *s)
-{
-    // toplevel and surface listeners — style-agnostic, always via add_listener
-    if (s->wm_base)
-        xdg_wm_base_add_listener(s->wm_base, &xdg_wm_base_listener, s);
-    if (s->xdg_surface)
-        xdg_surface_add_listener(s->xdg_surface, &xdg_surface_listener, s);
-    if (s->toplevel)
-        xdg_toplevel_add_listener(s->toplevel, &xdg_toplevel_listener, s);
-    if (s->seat)
-        wl_seat_add_listener(s->seat, &seat_listener, NULL);
 }
 
 // ---------------------------------------------------------------------------
