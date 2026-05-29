@@ -1,5 +1,8 @@
 #include "common.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,22 +11,56 @@
 #include <sys/prctl.h>
 
 // ---------------------------------------------------------------------------
-// Signal flags (volatile — read from signal handler and main loop)
+// Signal handling with self-pipe trick
 // ---------------------------------------------------------------------------
+// Signal handlers write a single byte to `signal_pipe[1]`.  The main loop
+// polls the read end alongside the Wayland display fd so that signals
+// are serviced instantly while still allowing the main thread to block —
+// which is necessary for the payload's ptrace injection to work reliably.
 
 static volatile sig_atomic_t should_exit      = 0;
 static volatile sig_atomic_t reset_requested  = 0;
 static volatile sig_atomic_t reregister_input = 0;
+static int signal_pipe[2] = { -1, -1 };
 
-static void handle_sigterm(int sig) { (void)sig; should_exit = 1; }
-static void handle_sigusr1(int sig) { (void)sig; reset_requested = 1; }
-static void handle_sigusr2(int sig) { (void)sig; reregister_input = 1; }
+static void wake_signal_pipe(void)
+{
+    char c = 1;
+    int saved = errno;
+    if (signal_pipe[1] >= 0) {
+        (void)write(signal_pipe[1], &c, 1);
+    }
+    errno = saved;
+}
+
+static void handle_sigterm(int sig) { (void)sig; should_exit = 1; wake_signal_pipe(); }
+static void handle_sigusr1(int sig) { (void)sig; reset_requested = 1; wake_signal_pipe(); }
+static void handle_sigusr2(int sig) { (void)sig; reregister_input = 1; wake_signal_pipe(); }
 
 void setup_signals(void)
 {
+    if (pipe(signal_pipe) != 0) {
+        fprintf(stderr, "Fixture: pipe failed\n");
+        signal_pipe[0] = signal_pipe[1] = -1;
+        return;
+    }
+    fcntl(signal_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(signal_pipe[1], F_SETFL, O_NONBLOCK);
+    fcntl(signal_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(signal_pipe[1], F_SETFD, FD_CLOEXEC);
+
     signal(SIGTERM, handle_sigterm);
     signal(SIGUSR1, handle_sigusr1);
     signal(SIGUSR2, handle_sigusr2);
+}
+
+/// Drain any bytes in the signal pipe.  Signal flags (set atomically by
+/// the handler) are consumed in the main loop.
+static void drain_signal_pipe(void)
+{
+    char buf[32];
+    while (signal_pipe[0] >= 0
+           && read(signal_pipe[0], buf, sizeof(buf)) > 0) {}
 }
 
 void allow_same_uid_ptrace(void)
@@ -541,7 +578,14 @@ int run_loop(struct app_state *s)
 
     print_event("EVENT: ready");
 
+    // Blocking dispatch with signal-aware poll.  We block the main
+    // thread in wl_display_dispatch (injection-safe) but install the
+    // signal pipe so we can wake up when signals arrive even if no
+    // Wayland events are pending.
+    int wayland_fd = wl_display_get_fd(s->display);
+
     while (!should_exit) {
+        // Check / service signal flags at the top of each iteration.
         if (reset_requested) {
             reset_requested = 0;
             s->keyboard_focused = false;
@@ -555,10 +599,43 @@ int run_loop(struct app_state *s)
             register_input_proxies(s);
         }
 
-        if (wl_display_dispatch(s->display) == -1) {
+        // Drain any events already in the read buffer.  This also
+        // triggers the payload's hooks (run_hooks/initial_sweep).
+        int rc = wl_display_dispatch_pending(s->display);
+        if (rc < 0)
+            break;
+
+        // Use the display's internal queue to determine if we need
+        // to block.
+        while (wl_display_prepare_read(s->display) != 0) {
+            if (wl_display_dispatch_pending(s->display) < 0)
+                goto break_outer;
+        }
+        wl_display_flush(s->display);
+
+        struct pollfd fds[2];
+        fds[0].fd = wayland_fd;
+        fds[0].events = POLLIN;
+        fds[1].fd = signal_pipe[0];
+        fds[1].events = POLLIN;
+
+        int prc = poll(fds, 2, -1 /* block */);
+        if (prc < 0 && errno != EINTR) {
+            wl_display_cancel_read(s->display);
             break;
         }
+
+        if (prc > 0 && (fds[0].revents & POLLIN)) {
+            // Wayland events arrived — read and dispatch.
+            wl_display_read_events(s->display);
+            wl_display_dispatch_pending(s->display);
+        } else {
+            // Signal or timeout — cancel the read.
+            wl_display_cancel_read(s->display);
+            drain_signal_pipe();
+        }
     }
+    break_outer:;
 
     return 0;
 }

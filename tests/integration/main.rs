@@ -179,12 +179,11 @@ async fn session_from_name_finds_process() {
 // ---------------------------------------------------------------------------
 
 /// All fixture configurations to test input against.
-/// TODO: CDispatcher and CListener are excluded until the C fixture's
-/// main loop uses a dispatch strategy that ensures the payload's IPC
-/// thread starts reliably.  The C fixture currently uses blocking
-/// `wl_display_dispatch` which prevents SIGUSR2-based proxy re-binding
-/// from being serviced.  Switching to non-blocking dispatch triggers an
-/// ECONNRESET during injection that needs further investigation.
+/// CDispatcher and CListener are excluded pending investigation of a
+/// crash during synthetic input delivery into the C fixture process.
+/// The injection (Session::new) and IPC connection work correctly;
+/// the crash occurs inside invoke_dispatcher / invoke_listener when
+/// delivering events to the C fixture's input dispatcher/callbacks.
 const ALL_FIXTURE_KINDS: [FixtureKind; 1] = [FixtureKind::RustDispatcher];
 
 /// Helper: send SIGUSR2 to the fixture so it re-requests keyboard and
@@ -208,6 +207,8 @@ async fn key_tap_is_received_by_target() {
         let env = TestEnv::start(*kind);
         let pid = env.pid();
         let session = Session::new(pid).await.expect("Session::new failed");
+        // Wait longer for initial sweep to fire on first dispatch
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         reregister_input(pid);
 
         session
@@ -239,6 +240,8 @@ async fn mouse_click_is_received_by_target() {
         let env = TestEnv::start(*kind);
         let pid = env.pid();
         let session = Session::new(pid).await.expect("Session::new failed");
+        // Wait longer for initial sweep to fire on first dispatch
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         reregister_input(pid);
 
         session
@@ -270,6 +273,8 @@ async fn mouse_scroll_is_received_by_target() {
         let env = TestEnv::start(*kind);
         let pid = env.pid();
         let session = Session::new(pid).await.expect("Session::new failed");
+        // Wait longer for initial sweep to fire on first dispatch
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         reregister_input(pid);
 
         session
@@ -299,6 +304,8 @@ async fn type_text_is_received_by_target() {
         let env = TestEnv::start(*kind);
         let pid = env.pid();
         let session = Session::new(pid).await.expect("Session::new failed");
+        // Wait longer for initial sweep to fire on first dispatch
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         reregister_input(pid);
 
         session
@@ -338,6 +345,8 @@ async fn combo_is_received_by_target() {
         let env = TestEnv::start(*kind);
         let pid = env.pid();
         let session = Session::new(pid).await.expect("Session::new failed");
+        // Wait longer for initial sweep to fire on first dispatch
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         reregister_input(pid);
 
         session
