@@ -187,9 +187,14 @@ fn store_real(symbol: &str, ptr: *mut c_void) {
 // We wrap capture_proxy in sigsetjmp/siglongjmp: if the deref chain
 // faults, the handler longjmps out, the entry is skipped, and the sweep
 // continues.
+//
+// __sigsetjmp is called directly from try_capture's frame so the saved
+// context remains alive across capture_proxy (unlike wrapping it in a
+// helper function, whose frame dies on return — POSIX requires the
+// setjmp frame to still be active at longjmp time).
 
 extern "C" {
-    fn sj_setjmp(buf: *mut c_void, savesigs: std::ffi::c_int) -> std::ffi::c_int;
+    fn __sigsetjmp(buf: *mut c_void, savesigs: std::ffi::c_int) -> std::ffi::c_int;
     fn sj_longjmp(buf: *mut c_void, val: std::ffi::c_int) -> !;
 }
 
@@ -199,28 +204,41 @@ extern "C" {
 #[allow(dead_code)]
 struct JmpBuf([u64; 32]);
 
+/// Single jmp_buf shared by try_capture (setjmp) and sweep_sig_handler
+/// (longjmp).  Module-level so both functions see the same buffer.
+static mut BUF: JmpBuf = JmpBuf([0; 32]);
+
 static SWEEP_ARMED: AtomicBool = AtomicBool::new(false);
 static SWEEP_SKIPPED: AtomicUsize = AtomicUsize::new(0);
 
 /// Signal handler installed around the sweep.  If ARMED, longjmps
-/// back to try_capture; otherwise forwards to the app's prior handler.
+/// back to try_capture; otherwise restores the app's old handler and
+/// re-raises the signal so the app's own crash handling runs.
 unsafe extern "C" fn sweep_sig_handler(sig: i32) {
     if SWEEP_ARMED.load(Ordering::Relaxed) {
         SWEEP_SKIPPED.fetch_add(1, Ordering::Relaxed);
-        static mut BUF: JmpBuf = JmpBuf([0; 32]);
-        sj_longjmp(&raw mut BUF as *mut c_void, 1);
-    } else {
-        libc::signal(sig, libc::SIG_DFL);
+        sj_longjmp((&raw mut BUF) as *mut c_void, 1);
+    }
+    // Not armed — forward to the app's handler.
+    let old = match sig {
+        libc::SIGSEGV => &raw const SAVED_OLD_SEGV,
+        libc::SIGBUS => &raw const SAVED_OLD_BUS,
+        _ => return,
+    };
+    unsafe {
+        libc::sigaction(sig, old, std::ptr::null_mut());
         libc::raise(sig);
     }
 }
 
 /// Guard a single capture_proxy call with sigsetjmp/siglongjmp.
 /// Returns true if capture succeeded without faulting.
+///
+/// __sigsetjmp is called here (not through a helper) so its frame is
+/// try_capture's, which stays alive across the capture_proxy call.
 unsafe fn try_capture(proxy: *mut c_void) -> bool {
-    static mut BUF: JmpBuf = JmpBuf([0; 32]);
     SWEEP_ARMED.store(true, Ordering::Release);
-    if sj_setjmp(&raw mut BUF as *mut c_void, 1) == 0 {
+    if __sigsetjmp((&raw mut BUF) as *mut c_void, 1) == 0 {
         capture_proxy(proxy);
         SWEEP_ARMED.store(false, Ordering::Release);
         true
@@ -230,27 +248,51 @@ unsafe fn try_capture(proxy: *mut c_void) -> bool {
     }
 }
 
-/// Install our SIGSEGV/SIGBUS handlers.  Returns the old ones.
-unsafe fn install_guard() -> (usize, usize) {
-    let old_segv = libc::signal(libc::SIGSEGV, sweep_sig_handler as *const () as usize);
-    let old_bus = libc::signal(libc::SIGBUS, sweep_sig_handler as *const () as usize);
-    (old_segv, old_bus)
+/// Saved old sigactions for SIGSEGV and SIGBUS — restored when our
+/// handler fires while ARMED is false (the app's own crash).
+static mut SAVED_OLD_SEGV: libc::sigaction = unsafe { std::mem::zeroed() };
+static mut SAVED_OLD_BUS: libc::sigaction = unsafe { std::mem::zeroed() };
+
+/// Install our SIGSEGV/SIGBUS handlers via sigaction, saving the old
+/// ones for proper restore.  sigaction preserves SA_SIGINFO/SA_ONSTACK
+/// flags that libc::signal() cannot represent.
+unsafe fn install_guard() {
+    let newact = libc::sigaction {
+        sa_sigaction: sweep_sig_handler as *const () as usize,
+        sa_mask: std::mem::zeroed(),
+        sa_flags: libc::SA_NODEFER,
+        sa_restorer: None,
+    };
+    libc::sigaction(
+        libc::SIGSEGV,
+        &newact,
+        &raw mut SAVED_OLD_SEGV,
+    );
+    libc::sigaction(
+        libc::SIGBUS,
+        &newact,
+        &raw mut SAVED_OLD_BUS,
+    );
 }
 
-unsafe fn uninstall_guard(old_segv: usize, old_bus: usize) {
-    if old_segv != libc::SIG_ERR {
-        libc::signal(libc::SIGSEGV, old_segv);
-    }
-    if old_bus != libc::SIG_ERR {
-        libc::signal(libc::SIGBUS, old_bus);
-    }
+unsafe fn uninstall_guard() {
+    libc::sigaction(
+        libc::SIGSEGV,
+        &raw const SAVED_OLD_SEGV,
+        std::ptr::null_mut(),
+    );
+    libc::sigaction(
+        libc::SIGBUS,
+        &raw const SAVED_OLD_BUS,
+        std::ptr::null_mut(),
+    );
 }
 
 /// Wrapper around the entire sweep that installs/removes the guard.
 unsafe fn guarded_sweep(display: *mut c_void) {
-    let (old_segv, old_bus) = install_guard();
+    install_guard();
     initial_sweep(display);
-    uninstall_guard(old_segv, old_bus);
+    uninstall_guard();
     let skipped = SWEEP_SKIPPED.swap(0, Ordering::Relaxed);
     if skipped > 0 {
         // We don't have stderr access safely; just silently drop.
@@ -512,6 +554,18 @@ unsafe extern "C" fn hook_add_dispatcher(
     capture_proxy(proxy);
     let real_ptr = REAL_ADD_DISPATCHER.load(Ordering::SeqCst);
     if real_ptr == 0 {
+        // Fall back to dlsym if GOT patching didn't capture the real
+        // pointer (e.g., lazy binding wrote a stub address).
+        let real = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"wl_proxy_add_dispatcher".as_ptr() as *const c_char,
+        );
+        if real.is_null() {
+            return;
+        }
+        let real: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) =
+            std::mem::transmute(real);
+        real(proxy, dispatcher, implementation, data);
         return;
     }
     let real: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) =
@@ -530,7 +584,16 @@ unsafe extern "C" fn hook_add_listener(
     capture_proxy(proxy);
     let real_ptr = REAL_ADD_LISTENER.load(Ordering::SeqCst);
     if real_ptr == 0 {
-        return -1;
+        let real = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"wl_proxy_add_listener".as_ptr() as *const c_char,
+        );
+        if real.is_null() {
+            return -1;
+        }
+        let real: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int =
+            std::mem::transmute(real);
+        return real(proxy, implementation, data);
     }
     let real: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int =
         std::mem::transmute(real_ptr);
@@ -2044,5 +2107,90 @@ mod tests {
         let (resp, _) = send(r#"{"type":"nonexistent_cmd"}"#);
         assert_eq!(resp["status"], "error");
         assert_eq!(resp["code"], "unknown_command");
+    }
+
+    // -----------------------------------------------------------------------
+    // sweep crash-guard — mmap-based fault injection
+    // -----------------------------------------------------------------------
+
+    /// Verify that `try_capture` catches a SIGSEGV from a stale
+    /// interface name deref (the 3-link chain proxy → interface →
+    /// name → strlen) and reports it as skipped.
+    ///
+    /// We mmap two pages:
+    ///  - page 1: fake wl_proxy + fake wl_interface
+    ///  - page 2: the string the interface name points to
+    /// Then we munmap page 2 so strlen on the name pointer faults.
+    /// try_capture must return false (skipped) and SWEEP_SKIPPED
+    /// must be > 0, proving the sigsetjmp/longjmp round-trip works.
+    #[test]
+    fn try_capture_skips_stale_interface_name_strlen_fault() {
+        let _g = lock();
+        let page_size = 4096;
+
+        unsafe {
+            // Map two consecutive pages.
+            let region = libc::mmap(
+                std::ptr::null_mut(),
+                2 * page_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(region, libc::MAP_FAILED, "mmap failed");
+
+            let page1 = region as usize;
+            let page2 = page1 + page_size;
+
+            // Write "wl_pointer" at the start of page 2 — this is what
+            // the fake interface.name will point to.  After we munmap
+            // page 2, strlen on this address will fault.
+            let name_bytes = b"wl_pointer\0";
+            std::ptr::copy_nonoverlapping(
+                name_bytes.as_ptr(),
+                page2 as *mut u8,
+                name_bytes.len(),
+            );
+
+            // Build a fake wl_interface on page 1: name → page 2.
+            let iface_ptr = page1 as *mut wl_interface;
+            (*iface_ptr).name = page2 as *const c_char;
+            (*iface_ptr).version = 7;
+            (*iface_ptr).method_count = 0;
+            (*iface_ptr).methods = std::ptr::null();
+            (*iface_ptr).event_count = 0;
+            (*iface_ptr).events = std::ptr::null();
+
+            // Build a fake wl_proxy on page 1 after the interface.
+            // Pad to keep 8-byte alignment.
+            let proxy_addr = page1 + core::mem::size_of::<wl_interface>();
+            let proxy_addr = (proxy_addr + 7) & !7;
+            let proxy_ptr = proxy_addr as *mut wl_proxy;
+            std::ptr::write_bytes(proxy_ptr, 0u8, 1);
+            (*proxy_ptr).object.interface = iface_ptr;
+
+            // Now munmap page 2 — the name string is gone.
+            let ret = libc::munmap(page2 as *mut c_void, page_size);
+            assert_eq!(ret, 0, "munmap failed");
+
+            // Reset the skip counter.
+            SWEEP_SKIPPED.store(0, Ordering::Relaxed);
+
+            // Install the guard — try_capture arms SWEEP_ARMED but does
+            // NOT install the signal handler (that's guarded_sweep's job).
+            install_guard();
+
+            // try_capture should fault → handler longjmps → returns false.
+            let ok = try_capture(proxy_ptr as *mut c_void);
+            assert!(!ok, "try_capture must return false for unmapped name");
+
+            let skipped = SWEEP_SKIPPED.load(Ordering::Relaxed);
+            assert_eq!(skipped, 1, "SWEEP_SKIPPED must be 1, got {skipped}");
+
+            // Uninstall the guard and clean up page 1.
+            uninstall_guard();
+            libc::munmap(page1 as *mut c_void, page_size);
+        }
     }
 }

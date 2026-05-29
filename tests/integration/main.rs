@@ -179,11 +179,9 @@ async fn session_from_name_finds_process() {
 // ---------------------------------------------------------------------------
 
 /// All fixture configurations to test input against.
-/// CDispatcher and CListener are excluded — the sigsetjmp guard fixes
-/// the sweep SIGSEGV (strlen on garbage interface->name), but a second
-/// crash occurs during input delivery (invoke_dispatcher/invoke_listener
-/// dereferencing a stale proxy pointer).  Likely the hooks aren't
-/// capturing valid proxies after reregister_input on the C fixture.
+/// CListener excluded: the input delivery pass for listener-mode C
+/// fixtures is still being debugged (hang on keyboard.tap).
+/// CDispatcher excluded: hangs on input delivery (likely same root cause).
 const ALL_FIXTURE_KINDS: [FixtureKind; 1] = [FixtureKind::RustDispatcher];
 
 /// Helper: send SIGUSR2 to the fixture so it re-requests keyboard and

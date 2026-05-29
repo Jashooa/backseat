@@ -1,20 +1,14 @@
-/* sigsetjmp/siglongjmp shim for the backseat payload.
+/* siglongjmp shim for the backseat payload.
  *
- * sigsetjmp and siglongjmp are typically macros, not linkable symbols,
- * so we can't FFI them directly from Rust.  This file exposes thin
- * wrappers that the payload can call.
+ * siglongjmp is typically a macro, not a linkable symbol,
+ * so we can't FFI it directly from Rust.  This file exposes a thin
+ * wrapper that the payload can call.
  *
- * __sigsetjmp is the glibc implementation (the macro expands to it).
- * On musl the real symbol may differ; adjust if needed.
+ * __sigsetjmp is called directly from Rust (it IS a real glibc symbol),
+ * so it doesn't need a wrapper here.
  */
 
 #include <setjmp.h>
-#include <stddef.h>
-
-int sj_setjmp(sigjmp_buf *buf, int savesigs)
-{
-    return sigsetjmp(*buf, savesigs);
-}
 
 void sj_longjmp(sigjmp_buf *buf, int val)
 {
