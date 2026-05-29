@@ -68,13 +68,29 @@ pub enum Error {
 
     /// The target is sandboxed in a way that prevents ptrace.
     /// The `reason` field describes the detected sandbox.
-    #[error("target PID {pid} is sandboxed: {reason}")]
+    #[error("target PID {pid} is sandboxed: {reason}. \
+        To inject into Flatpak apps, run outside the sandbox or install via `flatpak override --user --talk-name=org.freedesktop.Flatpak`. \
+        For Snap apps, use `--devmode` or `--classic` confinement. \
+        For containers, run the injector on the host, not inside the container.")]
     SandboxedTarget { pid: u32, reason: String },
 
     /// Yama ptrace_scope blocks tracing non-descendant processes.
-    /// On most distributions this can be relaxed with
-    /// `echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope`.
-    #[error("ptrace_scope is {current} (need 0 to trace arbitrary processes)")]
+    ///
+    /// **If you control the target process**, have it call
+    /// `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` at startup —
+    /// no root needed, works under scope=1.
+    ///
+    /// **If you control the injector binary**, grant it ptrace
+    /// permission permanently (survives reboot):
+    /// `sudo setcap cap_sys_ptrace+ep /path/to/your-binary`
+    ///
+    /// **One-shot with systemd-run**:
+    /// `systemd-run --user --pipe -p AmbientCapabilities=CAP_SYS_PTRACE your-binary ...`
+    #[error(
+        "ptrace_scope is {current} — cannot trace arbitrary processes. \
+        Grant CAP_SYS_PTRACE to your binary: `sudo setcap cap_sys_ptrace+ep $(which your-binary)`, \
+        or have the target call `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)`."
+    )]
     PtraceScopeRestricted { current: u32 },
 
     /// The target's libwayland version is incompatible with the payload's

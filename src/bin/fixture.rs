@@ -57,6 +57,17 @@ fn setup_signals() {
     }
 }
 
+/// Allow any process with the same UID to ptrace this process.
+///
+/// This is the cooperative bypass for Yama `ptrace_scope = 1` —
+/// no privilege, no global sysctl change, no setcap needed.
+/// The test runner (same UID) can then inject without root.
+fn allow_same_uid_ptrace() {
+    unsafe {
+        libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0);
+    }
+}
+
 /// Print a line to stdout and flush immediately.
 fn print_event(line: &str) {
     println!("{line}");
@@ -394,6 +405,7 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
 
 fn main() {
     setup_signals();
+    allow_same_uid_ptrace();
 
     let conn = Connection::connect_to_env().expect("Failed to connect to WAYLAND_DISPLAY");
     let mut event_queue: EventQueue<State> = conn.new_event_queue();

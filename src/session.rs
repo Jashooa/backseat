@@ -115,15 +115,52 @@ pub(crate) struct Response {
 // generic "permission denied" from ptrace.
 // ---------------------------------------------------------------------------
 
+/// Return the parent PID of `pid` by reading `/proc/<pid>/status`.
+fn read_ppid(pid: u32) -> Option<u32> {
+    let path = format!("/proc/{pid}/status");
+    let status = std::fs::read_to_string(path).ok()?;
+    for line in status.lines() {
+        if let Some(val) = line.strip_prefix("PPid:") {
+            return val.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+/// Return `true` if `pid` is a descendant (child, grandchild, …) of
+/// `ancestor_pid` by walking `/proc/<pid>/status` `PPid:` links up to
+/// PID 1.  Returns `false` on any `/proc` read error (conservative).
+fn is_descendant_of(pid: u32, ancestor_pid: u32) -> bool {
+    let mut current = pid;
+    for _ in 0..256 {
+        if current == ancestor_pid {
+            return true;
+        }
+        current = match read_ppid(current) {
+            Some(ppid) => ppid,
+            None => return false,
+        };
+        if current <= 1 {
+            break;
+        }
+    }
+    false
+}
+
 /// Run sandbox / ptrace-scope checks before attempting injection.
 /// Returns `Ok(())` if the target looks reachable, or a structured error
 /// with remediation text.
 fn preflight(pid: u32) -> Result<(), Error> {
-    // 1. Yama ptrace_scope
+    // 1. Yama ptrace_scope — only reject if scope is non-zero AND the
+    //    target is NOT a descendant of this process (scope=1 allows
+    //    tracing descendants unconditionally).
     if let Ok(scope) = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
         if let Ok(val) = scope.trim().parse::<u32>() {
             if val != 0 {
-                return Err(Error::PtraceScopeRestricted { current: val });
+                let our_pid = std::process::id();
+                if !is_descendant_of(pid, our_pid) {
+                    return Err(Error::PtraceScopeRestricted { current: val });
+                }
             }
         }
     }
