@@ -179,12 +179,11 @@ async fn session_from_name_finds_process() {
 // ---------------------------------------------------------------------------
 
 /// All fixture configurations to test input against.
-/// CDispatcher and CListener are excluded — initial_sweep encounters
-/// stale wl_map entries (freed proxy pointers from wl_display.sync
-/// callbacks) whose interface->name strlen runs off a mapped page
-/// → SIGSEGV.  A sigsetjmp/longjmp guard around the sweep is the
-/// proper fix; the roundtrip attempt in initial_sweep doesn't help
-/// because the roundtrip itself leaves fresh stale entries.
+/// CDispatcher and CListener are excluded — the sigsetjmp guard fixes
+/// the sweep SIGSEGV (strlen on garbage interface->name), but a second
+/// crash occurs during input delivery (invoke_dispatcher/invoke_listener
+/// dereferencing a stale proxy pointer).  Likely the hooks aren't
+/// capturing valid proxies after reregister_input on the C fixture.
 const ALL_FIXTURE_KINDS: [FixtureKind; 1] = [FixtureKind::RustDispatcher];
 
 /// Helper: send SIGUSR2 to the fixture so it re-requests keyboard and

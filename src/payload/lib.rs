@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -175,6 +175,89 @@ fn store_real(symbol: &str, ptr: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
+// Sigsetjmp guard — catches SIGSEGV / SIGBUS in capture_proxy
+// ---------------------------------------------------------------------------
+//
+// The initial_sweep wl_map walk can encounter entries pointing to freed
+// proxy memory.  capture_proxy dereferences proxy → object.interface →
+// interface.name → CStr::from_ptr (strlen), a 3-link chain where any
+// link can be garbage.  A single-byte is_mapped probe can't protect
+// against strlen running off a mapped page into unmapped territory.
+//
+// We wrap capture_proxy in sigsetjmp/siglongjmp: if the deref chain
+// faults, the handler longjmps out, the entry is skipped, and the sweep
+// continues.
+
+extern "C" {
+    fn sj_setjmp(buf: *mut c_void, savesigs: std::ffi::c_int) -> std::ffi::c_int;
+    fn sj_longjmp(buf: *mut c_void, val: std::ffi::c_int) -> !;
+}
+
+/// Over-sized, 16-byte-aligned buffer for sigjmp_buf.
+/// glibc x86-64 sigjmp_buf is ~200 bytes; 256 bytes is safe.
+#[repr(align(16))]
+#[allow(dead_code)]
+struct JmpBuf([u64; 32]);
+
+static SWEEP_ARMED: AtomicBool = AtomicBool::new(false);
+static SWEEP_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Signal handler installed around the sweep.  If ARMED, longjmps
+/// back to try_capture; otherwise forwards to the app's prior handler.
+unsafe extern "C" fn sweep_sig_handler(sig: i32) {
+    if SWEEP_ARMED.load(Ordering::Relaxed) {
+        SWEEP_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        static mut BUF: JmpBuf = JmpBuf([0; 32]);
+        sj_longjmp(&raw mut BUF as *mut c_void, 1);
+    } else {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Guard a single capture_proxy call with sigsetjmp/siglongjmp.
+/// Returns true if capture succeeded without faulting.
+unsafe fn try_capture(proxy: *mut c_void) -> bool {
+    static mut BUF: JmpBuf = JmpBuf([0; 32]);
+    SWEEP_ARMED.store(true, Ordering::Release);
+    if sj_setjmp(&raw mut BUF as *mut c_void, 1) == 0 {
+        capture_proxy(proxy);
+        SWEEP_ARMED.store(false, Ordering::Release);
+        true
+    } else {
+        SWEEP_ARMED.store(false, Ordering::Release);
+        false
+    }
+}
+
+/// Install our SIGSEGV/SIGBUS handlers.  Returns the old ones.
+unsafe fn install_guard() -> (usize, usize) {
+    let old_segv = libc::signal(libc::SIGSEGV, sweep_sig_handler as *const () as usize);
+    let old_bus = libc::signal(libc::SIGBUS, sweep_sig_handler as *const () as usize);
+    (old_segv, old_bus)
+}
+
+unsafe fn uninstall_guard(old_segv: usize, old_bus: usize) {
+    if old_segv != libc::SIG_ERR {
+        libc::signal(libc::SIGSEGV, old_segv);
+    }
+    if old_bus != libc::SIG_ERR {
+        libc::signal(libc::SIGBUS, old_bus);
+    }
+}
+
+/// Wrapper around the entire sweep that installs/removes the guard.
+unsafe fn guarded_sweep(display: *mut c_void) {
+    let (old_segv, old_bus) = install_guard();
+    initial_sweep(display);
+    uninstall_guard(old_segv, old_bus);
+    let skipped = SWEEP_SKIPPED.swap(0, Ordering::Relaxed);
+    if skipped > 0 {
+        // We don't have stderr access safely; just silently drop.
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Proxy capture
 // ---------------------------------------------------------------------------
 
@@ -256,9 +339,7 @@ unsafe fn initial_sweep(display: *mut c_void) {
     // Run a roundtrip to let libwayland drain any pending sync
     // callbacks.  wl_display.sync creates temporary proxy objects
     // whose entries survive in the wl_map until the callback fires
-    // and the object is destroyed — walking those stale entries
-    // would dereference freed heap memory (triggering strlen on a
-    // garbage interface name → SIGSEGV).
+    // and the object is destroyed.
     //
     // G_INITIAL_SWEEP_DONE is already set to true by run_hooks
     // before calling us, so nested dispatch hooks from this roundtrip
@@ -282,23 +363,12 @@ unsafe fn initial_sweep(display: *mut c_void) {
     if !entries.is_null() && count > 0 {
         let slice = std::slice::from_raw_parts(entries, count);
         for &entry_val in slice.iter() {
-            // Skip free-list entries, NULL, and ZOMBIE (freed) entries.
-            // libwayland stores WL_MAP_ENTRY_LEGACY / WL_MAP_ENTRY_ZOMBIE
-            // flags in the low two bits.  Zombie entries are proxies that
-            // have been destroyed — their memory may have been freed, so
-            // dereferencing them would SIGSEGV.
-            if entry_val & 0x2 != 0 {
-                continue; // WL_MAP_ENTRY_ZOMBIE — proxy already destroyed
-            }
+            // Skip free-list entries and NULL.  On x86_64 valid
+            // heap pointers always exceed u32::MAX, whereas free-list
+            // entries are small u32 indices.
             let entry_ptr = (entry_val & !0x3usize) as *mut c_void;
-            // On x86_64 valid heap pointers always exceed u32::MAX,
-            // whereas free-list (LEGACY) entries are small u32 indices.
             if entry_ptr as usize > u32::MAX as usize && !entry_ptr.is_null() {
-                // Validate the pointer is in mapped memory before
-                // dereferencing — stale entries can survive in the map.
-                if is_mapped(entry_ptr) {
-                    capture_proxy(entry_ptr);
-                }
+                try_capture(entry_ptr);
             }
         }
     }
@@ -309,34 +379,6 @@ unsafe fn initial_sweep(display: *mut c_void) {
     // pattern in wayland-backend's send_request).
     sweep_event_queues();
 }
-
-/// Return true if `ptr` points to mapped readable memory.
-/// Return `true` if the first byte at `ptr` is in mapped readable memory.
-///
-/// Uses `write()` to `/dev/null` — the kernel returns `-EFAULT` for
-/// unmapped pages without delivering SIGSEGV to userspace, unlike a
-/// direct dereference which would crash the process.
-#[cfg(not(test))]
-unsafe fn is_mapped(ptr: *mut c_void) -> bool {
-    static DEVNULL_FD: AtomicI32 = AtomicI32::new(-1);
-    let fd = DEVNULL_FD.load(Ordering::Relaxed);
-    let fd = if fd < 0 {
-        let new_fd = libc::open(
-            c"/dev/null".as_ptr() as *const c_char,
-            libc::O_WRONLY | libc::O_CLOEXEC,
-        );
-        if new_fd < 0 {
-            return false;
-        }
-        DEVNULL_FD.store(new_fd, Ordering::Relaxed);
-        new_fd
-    } else {
-        fd
-    };
-    libc::write(fd, ptr, 1) == 1
-}
-#[cfg(test)]
-unsafe fn is_mapped(_ptr: *mut c_void) -> bool { true }
 
 unsafe fn sweep_event_queues() {
     let queue = {
@@ -366,8 +408,8 @@ unsafe fn sweep_event_queues() {
     while cur != head && !cur.is_null() {
         let link_offset = core::mem::offset_of!(wl_proxy, queue_link);
         let proxy = (cur as usize - link_offset) as *mut c_void;
-        if proxy as usize > u32::MAX as usize && !proxy.is_null() && is_mapped(proxy) {
-            capture_proxy(proxy);
+        if proxy as usize > u32::MAX as usize && !proxy.is_null() {
+            try_capture(proxy);
         }
         cur = (*cur).next;
     }
@@ -381,7 +423,7 @@ unsafe fn run_hooks(display: *mut c_void) {
     G_DISPATCH_CALLED.store(true, Ordering::Release);
 
     if !G_INITIAL_SWEEP_DONE.swap(true, Ordering::SeqCst) {
-        initial_sweep(display);
+        guarded_sweep(display);
     }
 
     let cmds = {
