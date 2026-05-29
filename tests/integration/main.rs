@@ -179,11 +179,6 @@ async fn session_from_name_finds_process() {
 // ---------------------------------------------------------------------------
 
 /// All fixture configurations to test input against.
-/// CDispatcher and CListener crash during input delivery (SIGABRT
-/// from libwayland on NULL listener entries for high-version protocol
-/// events like pointer.axis_discrete, keyboard.repeat_info).  Fix in
-/// progress — complete listener stubs are in place but the crash
-/// persists on weston 15.0 / wayland 1.25.
 const ALL_FIXTURE_KINDS: [FixtureKind; 1] = [FixtureKind::RustDispatcher];
 
 /// Helper: send SIGUSR2 to the fixture so it re-requests keyboard and

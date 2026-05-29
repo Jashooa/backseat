@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -253,6 +253,12 @@ extern "C" fn toplevel_configure_shim(
 
 
 unsafe fn initial_sweep(display: *mut c_void) {
+    // TODO: the wl_map may contain stale entries from temporary
+    // Wayland objects (e.g. wl_display.sync callbacks).  Walking
+    // those entries dereferences freed proxy memory → SIGSEGV.
+    // The long-term fix is to run a roundtrip (using the unhooked
+    // wl_display_roundtrip) before the sweep, or use a memory-probe
+    // technique.  For now, initial_sweep is a best-effort walk.
     let d = display as *mut wl_display_header;
     let map = &(*d).objects;
     let entries = map.client_entries.data as *const usize;
@@ -290,16 +296,29 @@ unsafe fn initial_sweep(display: *mut c_void) {
 }
 
 /// Return true if `ptr` points to mapped readable memory.
-/// Uses `write` to /dev/null as a cheap probe — if the page isn't
-/// mapped, the libc call will segfault but we catch it.
-/// This is a best-effort check; it doesn't guarantee the memory
-/// contains a valid wl_proxy, just that it won't SIGSEGV on read.
+/// Return `true` if the first byte at `ptr` is in mapped readable memory.
+///
+/// Uses `write()` to `/dev/null` — the kernel returns `-EFAULT` for
+/// unmapped pages without delivering SIGSEGV to userspace, unlike a
+/// direct dereference which would crash the process.
 #[cfg(not(test))]
-unsafe fn is_mapped(_ptr: *mut c_void) -> bool {
-    // On Linux we can use mincore() to check if pages are resident,
-    // or we can just trust the wl_map filtering.  For now, skip the
-    // expensive probe and rely on the ZOMBIE + u32::MAX filters.
-    true
+unsafe fn is_mapped(ptr: *mut c_void) -> bool {
+    static DEVNULL_FD: AtomicI32 = AtomicI32::new(-1);
+    let fd = DEVNULL_FD.load(Ordering::Relaxed);
+    let fd = if fd < 0 {
+        let new_fd = libc::open(
+            c"/dev/null".as_ptr() as *const c_char,
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        );
+        if new_fd < 0 {
+            return false;
+        }
+        DEVNULL_FD.store(new_fd, Ordering::Relaxed);
+        new_fd
+    } else {
+        fd
+    };
+    libc::write(fd, ptr, 1) == 1
 }
 #[cfg(test)]
 unsafe fn is_mapped(_ptr: *mut c_void) -> bool { true }
@@ -332,7 +351,9 @@ unsafe fn sweep_event_queues() {
     while cur != head && !cur.is_null() {
         let link_offset = core::mem::offset_of!(wl_proxy, queue_link);
         let proxy = (cur as usize - link_offset) as *mut c_void;
-        capture_proxy(proxy);
+        if proxy as usize > u32::MAX as usize && !proxy.is_null() && is_mapped(proxy) {
+            capture_proxy(proxy);
+        }
         cur = (*cur).next;
     }
 }
@@ -432,8 +453,12 @@ unsafe extern "C" fn hook_add_dispatcher(
     data: *mut c_void,
 ) {
     capture_proxy(proxy);
+    let real_ptr = REAL_ADD_DISPATCHER.load(Ordering::SeqCst);
+    if real_ptr == 0 {
+        return;
+    }
     let real: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) =
-        std::mem::transmute(REAL_ADD_DISPATCHER.load(Ordering::SeqCst));
+        std::mem::transmute(real_ptr);
     real(proxy, dispatcher, implementation, data);
 }
 
@@ -446,8 +471,12 @@ unsafe extern "C" fn hook_add_listener(
     data: *mut c_void,
 ) -> c_int {
     capture_proxy(proxy);
+    let real_ptr = REAL_ADD_LISTENER.load(Ordering::SeqCst);
+    if real_ptr == 0 {
+        return -1;
+    }
     let real: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int =
-        std::mem::transmute(REAL_ADD_LISTENER.load(Ordering::SeqCst));
+        std::mem::transmute(real_ptr);
     real(proxy, implementation, data)
 }
 
@@ -680,9 +709,13 @@ unsafe fn invoke_listener(proxy: *mut c_void, opcode: u32, args: &[wl_argument])
 
     let data = (*p).user_data;
 
-    // Dispatch on opcode with correctly-typed function pointer casts.
-    // Opcode values are stable per protocol-version because they follow
-    // XML event declaration order.
+    // Determine proxy type to resolve opcode collisions:
+    // - opcode 3: wl_pointer.button vs wl_keyboard.key
+    // - opcode 4: wl_pointer.axis vs wl_keyboard.modifiers
+    // Both are 4×u32, so opcode 3 is safe; opcode 4 differs in arity
+    // (axis = 3 args, modifiers = 5 args) so we branch on interface.
+    let iface = proxy_interface_name(proxy);
+
     match opcode {
         2 /* motion */ if args.len() >= 3 => {
             let f: extern "C" fn(*mut c_void, *mut c_void, u32, i32, i32) =
@@ -691,24 +724,27 @@ unsafe fn invoke_listener(proxy: *mut c_void, opcode: u32, args: &[wl_argument])
             true
         }
         3 /* button (pointer) or key (keyboard) */ if args.len() >= 4 => {
+            // Both wl_pointer.button and wl_keyboard.key share the same
+            // signature: fn(data, proxy, u32 serial, u32 time, u32 button/key, u32 state).
             let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32) =
                 std::mem::transmute(func);
             f(data, proxy, args[0].u, args[1].u, args[2].u, args[3].u);
             true
         }
-        4 /* axis (pointer) or modifiers (keyboard) */ if args.len() >= 2 => {
-            if args.len() >= 3 {
-                // pointer.axis: time, axis, value (3 args)
-                let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32) =
+        4 /* axis (pointer, 3 args) or modifiers (keyboard, 5 args) */ => {
+            if iface == Some(b"wl_keyboard") {
+                // keyboard.modifiers: serial, depressed, latched, locked, group
+                let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32, u32) =
                     std::mem::transmute(func);
-                f(data, proxy, args[0].u, args[1].u, args[2].f);
+                f(data, proxy, args[0].u, args[1].u, args[2].u, args[3].u, args[4].u);
             } else {
-                // keyboard.modifiers: serial, dep, lat, lock, group (5 args)
-                // But we only have 2 args here — keyboard.modifiers uses
-                // 5 args total.  This branch is for pointer.axis.
-                let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32) =
-                    std::mem::transmute(func);
-                f(data, proxy, args[0].u, args[1].u, 0);
+                // pointer.axis: time, axis, value (and optionally axis_discrete)
+                // We only ever send the 3-arg form (opcode 4 with time/axis/value).
+                if args.len() >= 3 {
+                    let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32) =
+                        std::mem::transmute(func);
+                    f(data, proxy, args[0].u, args[1].u, args[2].f);
+                }
             }
             true
         }
