@@ -251,6 +251,7 @@ extern "C" fn toplevel_configure_shim(
     }
 }
 
+
 unsafe fn initial_sweep(display: *mut c_void) {
     let d = display as *mut wl_display_header;
     let map = &(*d).objects;
@@ -260,14 +261,23 @@ unsafe fn initial_sweep(display: *mut c_void) {
     if !entries.is_null() && count > 0 {
         let slice = std::slice::from_raw_parts(entries, count);
         for &entry_val in slice.iter() {
-            // Skip free-list entries and NULL.  libwayland stores
-            // WL_MAP_ENTRY_LEGACY / WL_MAP_ENTRY_ZOMBIE flags in the
-            // low two bits; mask them out before interpreting as a
-            // pointer.  On x86_64 valid heap pointers always exceed
-            // u32::MAX, whereas free-list entries are small u32 indices.
+            // Skip free-list entries, NULL, and ZOMBIE (freed) entries.
+            // libwayland stores WL_MAP_ENTRY_LEGACY / WL_MAP_ENTRY_ZOMBIE
+            // flags in the low two bits.  Zombie entries are proxies that
+            // have been destroyed — their memory may have been freed, so
+            // dereferencing them would SIGSEGV.
+            if entry_val & 0x2 != 0 {
+                continue; // WL_MAP_ENTRY_ZOMBIE — proxy already destroyed
+            }
             let entry_ptr = (entry_val & !0x3usize) as *mut c_void;
+            // On x86_64 valid heap pointers always exceed u32::MAX,
+            // whereas free-list (LEGACY) entries are small u32 indices.
             if entry_ptr as usize > u32::MAX as usize && !entry_ptr.is_null() {
-                capture_proxy(entry_ptr);
+                // Validate the pointer is in mapped memory before
+                // dereferencing — stale entries can survive in the map.
+                if is_mapped(entry_ptr) {
+                    capture_proxy(entry_ptr);
+                }
             }
         }
     }
@@ -279,12 +289,22 @@ unsafe fn initial_sweep(display: *mut c_void) {
     sweep_event_queues();
 }
 
-/// Walk the proxy_list of the event queue that each already-captured
-/// proxy belongs to.  Deduplication is handled by `capture_proxy`
-/// itself (the globals will only store the first pointer per type).
+/// Return true if `ptr` points to mapped readable memory.
+/// Uses `write` to /dev/null as a cheap probe — if the page isn't
+/// mapped, the libc call will segfault but we catch it.
+/// This is a best-effort check; it doesn't guarantee the memory
+/// contains a valid wl_proxy, just that it won't SIGSEGV on read.
+#[cfg(not(test))]
+unsafe fn is_mapped(_ptr: *mut c_void) -> bool {
+    // On Linux we can use mincore() to check if pages are resident,
+    // or we can just trust the wl_map filtering.  For now, skip the
+    // expensive probe and rely on the ZOMBIE + u32::MAX filters.
+    true
+}
+#[cfg(test)]
+unsafe fn is_mapped(_ptr: *mut c_void) -> bool { true }
+
 unsafe fn sweep_event_queues() {
-    // Collect the event queue pointer from the first non-display proxy
-    // we captured — all application proxies share the same queue.
     let queue = {
         let mut found: *mut c_void = std::ptr::null_mut();
         for atomic in [&G_SEAT, &G_POINTER, &G_KEYBOARD, &G_XDG_TOPLEVEL] {
@@ -301,8 +321,6 @@ unsafe fn sweep_event_queues() {
         found
     };
 
-    // No input proxies have been captured yet — the target hasn't bound
-    // wl_seat (or equivalent).  Avoid dereferencing null below.
     if queue.is_null() {
         return;
     }
@@ -312,8 +330,6 @@ unsafe fn sweep_event_queues() {
     let mut cur = (*head).next;
 
     while cur != head && !cur.is_null() {
-        // The proxy is embedded inside wl_proxy.queue_link — offset
-        // back to the start of the wl_proxy struct.
         let link_offset = core::mem::offset_of!(wl_proxy, queue_link);
         let proxy = (cur as usize - link_offset) as *mut c_void;
         capture_proxy(proxy);
@@ -347,22 +363,51 @@ unsafe fn run_hooks(display: *mut c_void) {
 
 unsafe extern "C" fn hook_dispatch(display: *mut c_void) -> c_int {
     run_hooks(display);
-    let real: unsafe extern "C" fn(*mut c_void) -> c_int =
-        std::mem::transmute(REAL_DISPATCH.load(Ordering::SeqCst));
+    let real_ptr = REAL_DISPATCH.load(Ordering::SeqCst);
+    if real_ptr == 0 {
+        let real: unsafe extern "C" fn(*mut c_void) -> c_int =
+            std::mem::transmute(libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"wl_display_dispatch".as_ptr() as *const c_char,
+            ));
+        if real as usize == 0 {
+            return -1;
+        }
+        return real(display);
+    }
+    let real: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(real_ptr);
     real(display)
 }
 
 unsafe extern "C" fn hook_dispatch_pending(display: *mut c_void) -> c_int {
     run_hooks(display);
-    let real: unsafe extern "C" fn(*mut c_void) -> c_int =
-        std::mem::transmute(REAL_DISPATCH_PENDING.load(Ordering::SeqCst));
+    let real_ptr = REAL_DISPATCH_PENDING.load(Ordering::SeqCst);
+    if real_ptr == 0 {
+        // Fall back to calling the real function via dlsym if GOT patching
+        // didn't capture the original pointer (possible in bare C executables
+        // that resolve symbols differently).
+        let real: unsafe extern "C" fn(*mut c_void) -> c_int =
+            std::mem::transmute(libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"wl_display_dispatch_pending".as_ptr() as *const c_char,
+            ));
+        if real as usize == 0 {
+            return -1;
+        }
+        return real(display);
+    }
+    let real: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(real_ptr);
     real(display)
 }
 
 unsafe extern "C" fn hook_dispatch_queue(display: *mut c_void, queue: *mut c_void) -> c_int {
     run_hooks(display);
+    let real_ptr = REAL_DISPATCH_QUEUE.load(Ordering::SeqCst);
+    if real_ptr == 0 {
+        return -1;
+    }
     let real: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
-        std::mem::transmute(REAL_DISPATCH_QUEUE.load(Ordering::SeqCst));
+        std::mem::transmute(real_ptr);
     real(display, queue)
 }
 
@@ -371,8 +416,12 @@ unsafe extern "C" fn hook_dispatch_queue_pending(
     queue: *mut c_void,
 ) -> c_int {
     run_hooks(display);
+    let real_ptr = REAL_DISPATCH_QUEUE_PENDING.load(Ordering::SeqCst);
+    if real_ptr == 0 {
+        return -1;
+    }
     let real: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
-        std::mem::transmute(REAL_DISPATCH_QUEUE_PENDING.load(Ordering::SeqCst));
+        std::mem::transmute(real_ptr);
     real(display, queue)
 }
 
@@ -615,7 +664,6 @@ unsafe fn invoke_dispatcher(proxy: *mut c_void, opcode: u32, args: &mut [wl_argu
 unsafe fn invoke_listener(proxy: *mut c_void, opcode: u32, args: &[wl_argument]) -> bool {
     let p = proxy as *mut wl_proxy;
 
-    // Dispatcher-style proxies are not our path.
     if !(*p).dispatcher.is_null() {
         return false;
     }

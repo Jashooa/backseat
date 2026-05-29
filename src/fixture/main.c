@@ -24,7 +24,6 @@ int main(int argc, char **argv)
 
     setup_signals();
     allow_same_uid_ptrace();
-
     if (connect_and_bind(&state) != 0)
         return 1;
 

@@ -380,13 +380,71 @@ static void pointer_frame(void *data,
     // about button/motion/axis events.
 }
 
+static void pointer_axis_source(void *data,
+                                struct wl_pointer *wl_pointer,
+                                uint32_t axis_source)
+{
+    (void)data;
+    (void)wl_pointer;
+    (void)axis_source;
+}
+
+static void pointer_axis_stop(void *data,
+                              struct wl_pointer *wl_pointer,
+                              uint32_t time,
+                              uint32_t axis)
+{
+    (void)data;
+    (void)wl_pointer;
+    (void)time;
+    (void)axis;
+}
+
+static void pointer_axis_discrete(void *data,
+                                   struct wl_pointer *wl_pointer,
+                                   uint32_t axis,
+                                   int32_t discrete)
+{
+    (void)data;
+    (void)wl_pointer;
+    (void)axis;
+    (void)discrete;
+}
+
+static void pointer_axis_relative_direction(void *data,
+                                            struct wl_pointer *wl_pointer,
+                                            uint32_t axis,
+                                            uint32_t direction)
+{
+    (void)data;
+    (void)wl_pointer;
+    (void)axis;
+    (void)direction;
+}
+
+static void pointer_axis_value120(void *data,
+                                  struct wl_pointer *wl_pointer,
+                                  uint32_t axis,
+                                  int32_t value120)
+{
+    (void)data;
+    (void)wl_pointer;
+    (void)axis;
+    (void)value120;
+}
+
 static const struct wl_pointer_listener pointer_listener = {
-    .enter  = pointer_enter,
-    .leave  = pointer_leave,
-    .motion = pointer_motion,
-    .button = pointer_button,
-    .axis   = pointer_axis,
-    .frame  = pointer_frame,
+    .enter                  = pointer_enter,
+    .leave                  = pointer_leave,
+    .motion                 = pointer_motion,
+    .button                 = pointer_button,
+    .axis                   = pointer_axis,
+    .frame                  = pointer_frame,
+    .axis_source            = pointer_axis_source,
+    .axis_stop              = pointer_axis_stop,
+    .axis_discrete          = pointer_axis_discrete,
+    .axis_value120          = pointer_axis_value120,
+    .axis_relative_direction = pointer_axis_relative_direction,
 };
 
 static void keyboard_keymap(void *data,
@@ -463,12 +521,24 @@ static void keyboard_modifiers(void *data,
     fflush(stdout);
 }
 
+static void keyboard_repeat_info(void *data,
+                                  struct wl_keyboard *wl_keyboard,
+                                  int32_t rate,
+                                  int32_t delay)
+{
+    (void)data;
+    (void)wl_keyboard;
+    (void)rate;
+    (void)delay;
+}
+
 static const struct wl_keyboard_listener keyboard_listener = {
-    .keymap    = keyboard_keymap,
-    .enter     = keyboard_enter,
-    .leave     = keyboard_leave,
-    .key       = keyboard_key,
-    .modifiers = keyboard_modifiers,
+    .keymap      = keyboard_keymap,
+    .enter       = keyboard_enter,
+    .leave       = keyboard_leave,
+    .key         = keyboard_key,
+    .modifiers   = keyboard_modifiers,
+    .repeat_info = keyboard_repeat_info,
 };
 
 // ---------------------------------------------------------------------------
