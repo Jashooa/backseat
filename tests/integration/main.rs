@@ -179,9 +179,16 @@ async fn session_from_name_finds_process() {
 // ---------------------------------------------------------------------------
 
 /// All fixture configurations to test input against.
-/// CListener excluded: the input delivery pass for listener-mode C
-/// fixtures is still being debugged (hang on keyboard.tap).
-/// CDispatcher excluded: hangs on input delivery (likely same root cause).
+///
+/// CDispatcher and CListener excluded: the C fixture uses a blocking
+/// poll(..., -1) which doesn't wake when the payload queues a command.
+/// The hooks drain the queue on dispatch_pending, but dispatch_pending
+/// only runs when poll() returns.  After a keyboard.tap(), no Wayland
+/// event arrives to wake the fd, and poll() blocks forever.
+/// Fix is to either use a non-blocking poll loop (like the Rust
+/// fixture's dispatch_pending + sleep 10ms) or have the payload wake
+/// the target process (e.g. write to the signal pipe from the IPC
+/// thread when a command is queued).
 const ALL_FIXTURE_KINDS: [FixtureKind; 1] = [FixtureKind::RustDispatcher];
 
 /// Helper: send SIGUSR2 to the fixture so it re-requests keyboard and

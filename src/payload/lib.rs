@@ -720,8 +720,20 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
 
         let got_entry = (load_bias + rela.r_offset as usize) as *mut *mut c_void;
 
-        // Save the real pointer.
-        let real = *got_entry;
+        // Resolve the real function pointer via dlsym instead of
+        // reading the GOT slot directly.  Under lazy binding an
+        // unresolved slot contains the PLT resolver stub, not the
+        // real function.  If we saved the stub as REAL and later
+        // called it, the resolver would write the resolved address
+        // back into the GOT — overwriting our hook and silently
+        // disabling it after the first call through the slot.
+        let c_sym = std::ffi::CString::new(symbol).unwrap();
+        let resolved = libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr());
+        let real = if resolved.is_null() {
+            *got_entry
+        } else {
+            resolved
+        };
         store_real(symbol, real);
 
         let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
