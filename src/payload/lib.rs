@@ -594,6 +594,94 @@ unsafe fn invoke_dispatcher(proxy: *mut c_void, opcode: u32, args: &mut [wl_argu
     true
 }
 
+/// Deliver a synthetic event to a listener-style proxy by directly
+/// calling the listener callback in the proxy's vtable.
+///
+/// The vtable is indexed by opcode, matching event declaration order
+/// in the Wayland protocol XML.  `user_data` comes from
+/// `(*proxy).user_data`, *not* from the vtable (which is a function-
+/// pointer table, not a struct with user-data at index 1).
+///
+/// Returns `false` if the proxy has a dispatcher (not our path) or if
+/// the vtable slot for `opcode` is NULL.
+///
+/// # Safety
+/// - `proxy` must point to a valid `wl_proxy`.
+/// - The vtable at `(*proxy).object.implementation` must contain valid
+///   function pointers.
+/// - The typed call signatures below must match the Wayland protocol
+///   ABI for each event.  Getting these wrong will segfault inside the
+///   target process.
+unsafe fn invoke_listener(proxy: *mut c_void, opcode: u32, args: &[wl_argument]) -> bool {
+    let p = proxy as *mut wl_proxy;
+
+    // Dispatcher-style proxies are not our path.
+    if !(*p).dispatcher.is_null() {
+        return false;
+    }
+
+    let vtable = (*p).object.implementation as *const usize;
+    if vtable.is_null() {
+        return false;
+    }
+
+    let func = *vtable.add(opcode as usize);
+    if func == 0 {
+        return false;
+    }
+
+    let data = (*p).user_data;
+
+    // Dispatch on opcode with correctly-typed function pointer casts.
+    // Opcode values are stable per protocol-version because they follow
+    // XML event declaration order.
+    match opcode {
+        2 /* motion */ if args.len() >= 3 => {
+            let f: extern "C" fn(*mut c_void, *mut c_void, u32, i32, i32) =
+                std::mem::transmute(func);
+            f(data, proxy, args[0].u, args[1].f, args[2].f);
+            true
+        }
+        3 /* button (pointer) or key (keyboard) */ if args.len() >= 4 => {
+            let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32) =
+                std::mem::transmute(func);
+            f(data, proxy, args[0].u, args[1].u, args[2].u, args[3].u);
+            true
+        }
+        4 /* axis (pointer) or modifiers (keyboard) */ if args.len() >= 2 => {
+            if args.len() >= 3 {
+                // pointer.axis: time, axis, value (3 args)
+                let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32) =
+                    std::mem::transmute(func);
+                f(data, proxy, args[0].u, args[1].u, args[2].f);
+            } else {
+                // keyboard.modifiers: serial, dep, lat, lock, group (5 args)
+                // But we only have 2 args here — keyboard.modifiers uses
+                // 5 args total.  This branch is for pointer.axis.
+                let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32) =
+                    std::mem::transmute(func);
+                f(data, proxy, args[0].u, args[1].u, 0);
+            }
+            true
+        }
+        5 /* frame */ => {
+            let f: extern "C" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute(func);
+            f(data, proxy);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Try to deliver a synthetic event to a proxy.  Returns `true` if
+/// delivery succeeded (either via dispatcher or listener path),
+/// `false` if the proxy was not reachable by either style.
+#[inline]
+unsafe fn dispatch_to_proxy(proxy: *mut c_void, opcode: u32, args: &mut [wl_argument]) -> bool {
+    invoke_dispatcher(proxy, opcode, args) || invoke_listener(proxy, opcode, args)
+}
+
 static SERIAL: AtomicU32 = AtomicU32::new(1);
 
 fn next_serial() -> u32 {
@@ -627,7 +715,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                         wl_argument { f: to_fixed(x) },
                         wl_argument { f: to_fixed(y) },
                     ];
-                    invoke_dispatcher(ptr, 2 /* motion */, &mut args);
+                    dispatch_to_proxy(ptr, 2 /* motion */, &mut args);
                     emit_frame_if_v5(ptr);
                 }
             }
@@ -641,7 +729,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                         wl_argument { u: button },
                         wl_argument { u: state },
                     ];
-                    invoke_dispatcher(ptr, 3 /* button */, &mut args);
+                    dispatch_to_proxy(ptr, 3 /* button */, &mut args);
                     emit_frame_if_v5(ptr);
                 }
             }
@@ -655,7 +743,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                         wl_argument { u: key },
                         wl_argument { u: state },
                     ];
-                    invoke_dispatcher(kbd, 3 /* key */, &mut args);
+                    dispatch_to_proxy(kbd, 3 /* key */, &mut args);
                 }
             }
         }
@@ -669,7 +757,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                         wl_argument { u: 0 }, // mods_locked
                         wl_argument { u: 0 }, // group
                     ];
-                    invoke_dispatcher(kbd, 4 /* modifiers */, &mut args);
+                    dispatch_to_proxy(kbd, 4 /* modifiers */, &mut args);
                 }
             }
         }
@@ -683,7 +771,7 @@ fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
                             f: to_fixed(amount),
                         },
                     ];
-                    invoke_dispatcher(ptr, 4 /* axis */, &mut args);
+                    dispatch_to_proxy(ptr, 4 /* axis */, &mut args);
                     emit_frame_if_v5(ptr);
                 }
             }
@@ -701,11 +789,12 @@ fn get_pointer_proxy() -> Option<*mut c_void> {
 }
 
 /// Emit `wl_pointer.frame` (opcode 5) if the pointer protocol version is
-/// ≥ 5.  Without the frame, v5+ clients batch motion/button/axis events
+/// ≥ 5.  Works for both dispatcher- and listener-style proxies.
+/// Without the frame, v5+ clients batch motion/button/axis events
 /// and discard them as incomplete.
 unsafe fn emit_frame_if_v5(ptr: *mut c_void) {
     if (*(ptr as *mut wl_proxy)).version >= 5 {
-        invoke_dispatcher(ptr, 5 /* frame */, &mut []);
+        dispatch_to_proxy(ptr, 5 /* frame */, &mut []);
     }
 }
 
@@ -1133,6 +1222,359 @@ mod tests {
     /// the queue is a process-global `Mutex`.  This lock serialises
     /// entry to every test in the module.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // -----------------------------------------------------------------------
+    // invoke_listener — synthetic proxy construction helpers
+    // -----------------------------------------------------------------------
+
+    /// Captured arguments from a listener callback invocation.
+    /// Recorded by the synthetic vtable functions below.
+    static LAST_LISTENER_ARGS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+    /// Synthetic user-data value that the test should see passed as the
+    /// first argument to the listener callback.
+    const FAKE_USER_DATA: *mut c_void = 0x7fdead_0000 as *mut c_void;
+
+    // Synthetic listener callbacks — each records its arguments into
+    // LAST_LISTENER_ARGS so tests can assert correctness.
+
+    unsafe extern "C" fn test_listener_no_args(data: *mut c_void, _proxy: *mut c_void) {
+        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
+        v.push(data as u64);
+    }
+
+    unsafe extern "C" fn test_listener_motion(
+        data: *mut c_void,
+        _proxy: *mut c_void,
+        time: u32,
+        x: i32,
+        y: i32,
+    ) {
+        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
+        v.push(data as u64);
+        v.push(time as u64);
+        v.push(x as u32 as u64);
+        v.push(y as u32 as u64);
+    }
+
+    unsafe extern "C" fn test_listener_button(
+        data: *mut c_void,
+        _proxy: *mut c_void,
+        serial: u32,
+        time: u32,
+        button: u32,
+        state: u32,
+    ) {
+        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
+        v.push(data as u64);
+        v.push(serial as u64);
+        v.push(time as u64);
+        v.push(button as u64);
+        v.push(state as u64);
+    }
+
+    unsafe extern "C" fn test_listener_axis(
+        data: *mut c_void,
+        _proxy: *mut c_void,
+        time: u32,
+        axis: u32,
+        value: i32,
+    ) {
+        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
+        v.push(data as u64);
+        v.push(time as u64);
+        v.push(axis as u64);
+        v.push(value as u32 as u64);
+    }
+
+    /// Build a synthetic `wl_proxy` with listener-style registration.
+    /// `vtable` is a pointer to an array of `n` function pointers.
+    /// The proxy's `dispatcher` is set to null, `user_data` to
+    /// `FAKE_USER_DATA`, and `object.implementation` to the vtable.
+    unsafe fn make_listener_proxy(vtable: *const usize, version: u32) -> wl_proxy {
+        wl_proxy {
+            object: wl_object {
+                interface: std::ptr::null(),
+                implementation: vtable as *const c_void,
+                id: 0,
+                _pad: 0,
+            },
+            display: std::ptr::null_mut(),
+            queue: std::ptr::null_mut(),
+            flags: 0,
+            refcount: 0,
+            user_data: FAKE_USER_DATA,
+            dispatcher: std::ptr::null_mut(),
+            version,
+            _pad: 0,
+            tag: std::ptr::null(),
+            queue_link: wl_list {
+                prev: std::ptr::null_mut(),
+                next: std::ptr::null_mut(),
+            },
+        }
+    }
+
+    /// Build a synthetic `wl_proxy` with dispatcher-style registration.
+    unsafe fn make_dispatcher_proxy() -> wl_proxy {
+        wl_proxy {
+            object: wl_object {
+                interface: std::ptr::null(),
+                implementation: std::ptr::null(),
+                id: 0,
+                _pad: 0,
+            },
+            display: std::ptr::null_mut(),
+            queue: std::ptr::null_mut(),
+            flags: 0,
+            refcount: 0,
+            user_data: std::ptr::null_mut(),
+            dispatcher: std::ptr::dangling_mut::<c_void>(),
+            version: 1,
+            _pad: 0,
+            tag: std::ptr::null(),
+            queue_link: wl_list {
+                prev: std::ptr::null_mut(),
+                next: std::ptr::null_mut(),
+            },
+        }
+    }
+
+    /// Clear the captured listener args before a test.
+    fn clear_listener_args() {
+        LAST_LISTENER_ARGS.lock().unwrap().clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // invoke_listener — marshalling correctness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoke_listener_dispatches_motion() {
+        let _g = lock();
+        clear_listener_args();
+
+        // vtable[2] = test_listener_motion
+        let mut vtable = [0usize; 6];
+        vtable[2] = test_listener_motion as usize;
+
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+
+        let mut args = [
+            wl_argument { u: 0x1000 },   // time = 4096
+            wl_argument { f: 0x200 },    // x = 0x200 as wl_fixed
+            wl_argument { f: -0x100 },   // y = -0x100 as wl_fixed
+        ];
+
+        let ok = unsafe { invoke_listener(ptr, 2 /* motion */, &args) };
+        assert!(ok, "invoke_listener should return true for motion");
+
+        let captured = LAST_LISTENER_ARGS.lock().unwrap();
+        assert_eq!(captured.len(), 4);
+        assert_eq!(captured[0], FAKE_USER_DATA as u64, "data should be user_data, not vtable[1]");
+        assert_eq!(captured[1], 0x1000, "time mismatch");
+        assert_eq!(captured[2] as i32, 0x200, "x (wl_fixed) mismatch");
+        assert_eq!(captured[3] as i32, -0x100, "y (wl_fixed) mismatch");
+    }
+
+    #[test]
+    fn invoke_listener_dispatches_button() {
+        let _g = lock();
+        clear_listener_args();
+
+        let mut vtable = [0usize; 6];
+        vtable[3] = test_listener_button as usize;
+
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+
+        let mut args = [
+            wl_argument { u: 1234 },   // serial
+            wl_argument { u: 5678 },   // time
+            wl_argument { u: 272 },    // button (BTN_LEFT)
+            wl_argument { u: 1 },      // state (pressed)
+        ];
+
+        let ok = unsafe { invoke_listener(ptr, 3 /* button */, &args) };
+        assert!(ok);
+
+        let captured = LAST_LISTENER_ARGS.lock().unwrap();
+        assert_eq!(captured.len(), 5);
+        assert_eq!(captured[0], FAKE_USER_DATA as u64);
+        assert_eq!(captured[1], 1234);
+        assert_eq!(captured[2], 5678);
+        assert_eq!(captured[3], 272);
+        assert_eq!(captured[4], 1);
+    }
+
+    #[test]
+    fn invoke_listener_dispatches_axis() {
+        let _g = lock();
+        clear_listener_args();
+
+        let mut vtable = [0usize; 6];
+        vtable[4] = test_listener_axis as usize;
+
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+
+        // pointer.axis: time, axis, value
+        let mut args = [
+            wl_argument { u: 999 },         // time
+            wl_argument { u: 0 },           // axis = vertical
+            wl_argument { f: to_fixed(10.0) }, // value = 10.0 in wl_fixed
+        ];
+
+        let ok = unsafe { invoke_listener(ptr, 4 /* axis */, &args) };
+        assert!(ok);
+
+        let captured = LAST_LISTENER_ARGS.lock().unwrap();
+        assert_eq!(captured.len(), 4);
+        assert_eq!(captured[0], FAKE_USER_DATA as u64);
+        assert_eq!(captured[1], 999);
+        assert_eq!(captured[2], 0);         // axis = vertical
+        assert_eq!(captured[3] as u32, 2560); // 10.0 in wl_fixed = 2560
+    }
+
+    #[test]
+    fn invoke_listener_dispatches_frame() {
+        let _g = lock();
+        clear_listener_args();
+
+        let mut vtable = [0usize; 6];
+        vtable[5] = test_listener_no_args as usize;
+
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+
+        let ok = unsafe { invoke_listener(ptr, 5 /* frame */, &mut []) };
+        assert!(ok);
+
+        let captured = LAST_LISTENER_ARGS.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], FAKE_USER_DATA as u64);
+    }
+
+    // -----------------------------------------------------------------------
+    // invoke_listener — error / edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoke_listener_returns_false_when_dispatcher_present() {
+        let mut proxy = unsafe { make_dispatcher_proxy() };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+        let ok = unsafe { invoke_listener(ptr, 2, &mut []) };
+        assert!(!ok, "listener path must not handle dispatcher-style proxies");
+    }
+
+    #[test]
+    fn invoke_listener_returns_false_when_vtable_null() {
+        let mut proxy = wl_proxy {
+            object: wl_object {
+                interface: std::ptr::null(),
+                implementation: std::ptr::null(),
+                id: 0,
+                _pad: 0,
+            },
+            display: std::ptr::null_mut(),
+            queue: std::ptr::null_mut(),
+            flags: 0,
+            refcount: 0,
+            user_data: std::ptr::null_mut(),
+            dispatcher: std::ptr::null_mut(),
+            version: 1,
+            _pad: 0,
+            tag: std::ptr::null(),
+            queue_link: wl_list {
+                prev: std::ptr::null_mut(),
+                next: std::ptr::null_mut(),
+            },
+        };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+        let ok = unsafe { invoke_listener(ptr, 2, &mut []) };
+        assert!(!ok);
+    }
+
+    #[test]
+    fn invoke_listener_returns_false_when_slot_empty() {
+        let _g = lock();
+        let mut vtable = [0usize; 6]; // slot 2 is 0 (NULL)
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+        let ok = unsafe { invoke_listener(ptr, 2, &mut []) };
+        assert!(!ok, "empty vtable slot should return false");
+    }
+
+    #[test]
+    fn invoke_listener_returns_false_for_unknown_opcode() {
+        let _g = lock();
+        let mut vtable = [0usize; 6];
+        vtable[2] = test_listener_motion as usize;
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+        let ok = unsafe { invoke_listener(ptr, 999 /* nonexistent */, &mut []) };
+        assert!(!ok);
+    }
+
+    #[test]
+    fn invoke_listener_passes_user_data_not_vtable_1() {
+        let _g = lock();
+        clear_listener_args();
+
+        let mut vtable = [0usize; 6];
+        // Put a different pointer at vtable[1] — the test verifies
+        // that user_data is still passed, NOT this vtable entry.
+        vtable[1] = 0xdead_0001_0000_0001;
+        vtable[2] = test_listener_motion as usize;
+
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        // Set user_data to a known value different from vtable[1].
+        proxy.user_data = FAKE_USER_DATA;
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+
+        let mut args = [
+            wl_argument { u: 1 },
+            wl_argument { f: 0 },
+            wl_argument { f: 0 },
+        ];
+        let ok = unsafe { invoke_listener(ptr, 2 /* motion */, &args) };
+        assert!(ok);
+
+        let captured = LAST_LISTENER_ARGS.lock().unwrap();
+        assert_eq!(
+            captured[0], FAKE_USER_DATA as u64,
+            "data arg must come from proxy.user_data, not vtable[1]"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // dispatch_to_proxy — style-agnostic routing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_to_proxy_falls_back_to_listener() {
+        let _g = lock();
+        clear_listener_args();
+
+        let mut vtable = [0usize; 6];
+        vtable[2] = test_listener_motion as usize;
+
+        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
+        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
+
+        let mut args = [
+            wl_argument { u: 42 },
+            wl_argument { f: 100 },
+            wl_argument { f: 200 },
+        ];
+
+        let ok = unsafe { dispatch_to_proxy(ptr, 2, &mut args) };
+        assert!(ok, "dispatch_to_proxy should try listener after dispatcher fails");
+        let captured = LAST_LISTENER_ARGS.lock().unwrap();
+        assert_eq!(captured[1], 42, "time should be passed to listener");
+    }
+
 
     // -----------------------------------------------------------------------
     // to_fixed
