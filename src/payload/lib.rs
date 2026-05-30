@@ -209,6 +209,7 @@ fn store_real(symbol: &str, ptr: *mut c_void) {
 extern "C" {
     fn __sigsetjmp(buf: *mut c_void, savesigs: std::ffi::c_int) -> std::ffi::c_int;
     fn sj_longjmp(buf: *mut c_void, val: std::ffi::c_int) -> !;
+    fn patch_gots_via_phdrs(symbol: *const std::ffi::c_char, hook: *mut c_void);
 }
 
 /// Over-sized, 16-byte-aligned buffer for sigjmp_buf.
@@ -1208,6 +1209,21 @@ struct Elf64Sym {
 // Synthetic input dispatch — calls the proxy's dispatcher directly.
 // ---------------------------------------------------------------------------
 
+/// Called from C (shim.c) via dl_iterate_phdr for each loaded module.
+/// FIXME: the PT_DYNAMIC + DT_JMPREL walk body triggers SIGSEGV during
+/// dlopen on some module.  The no-op return proves the callback mechanism
+/// is correct; filling in the body is the next step.
+#[no_mangle]
+unsafe extern "C" fn rust_patch_got_for_module(
+    _base: usize,
+    _phdr: *const Elf64Phdr,
+    _phnum: u16,
+    _symbol: *const std::ffi::c_char,
+    _hook: *mut c_void,
+) -> std::ffi::c_int {
+    0
+}
+
 /// Matches libwayland's `union wl_argument`.
 #[repr(C)]
 union wl_argument {
@@ -1825,6 +1841,23 @@ extern "C" fn init() {
         );
         patch_all_gots("poll", hook_poll as *mut c_void);
         patch_all_gots("ppoll", hook_ppoll as *mut c_void);
+
+        // Secondary: also try dl_iterate_phdr for modules goblin missed.
+        // Currently no-op (rust_patch_got_for_module returns 0 immediately).
+        macro_rules! phdr_patch {
+            ($sym:expr, $hook:expr) => {
+                let cs = std::ffi::CString::new($sym).unwrap();
+                patch_gots_via_phdrs(cs.as_ptr(), $hook as *mut c_void);
+            };
+        }
+        phdr_patch!("wl_display_dispatch", hook_dispatch);
+        phdr_patch!("wl_display_dispatch_pending", hook_dispatch_pending);
+        phdr_patch!("wl_display_dispatch_queue", hook_dispatch_queue);
+        phdr_patch!("wl_display_dispatch_queue_pending", hook_dispatch_queue_pending);
+        phdr_patch!("wl_proxy_add_dispatcher", hook_add_dispatcher);
+        phdr_patch!("wl_proxy_add_listener", hook_add_listener);
+        phdr_patch!("poll", hook_poll);
+        phdr_patch!("ppoll", hook_ppoll);
     }
 }
 
