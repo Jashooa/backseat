@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,17 @@ static REAL_DISPATCH_QUEUE: AtomicUsize = AtomicUsize::new(0);
 static REAL_DISPATCH_QUEUE_PENDING: AtomicUsize = AtomicUsize::new(0);
 static REAL_ADD_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
 static REAL_ADD_LISTENER: AtomicUsize = AtomicUsize::new(0);
+static REAL_POLL: AtomicUsize = AtomicUsize::new(0);
+static REAL_PPOLL: AtomicUsize = AtomicUsize::new(0);
+
+/// Eventfd written by the IPC thread after queuing a command.
+/// The poll/ppoll hook adds this fd to the poll set so that any
+/// blocked poll() in the target wakes and the dispatch hooks drain
+/// the command queue.
+static WAKE_EVENTFD: AtomicI32 = AtomicI32::new(-1);
+
+/// Number of times the poll hook has been invoked (diagnostic).
+static POLL_HOOK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-toplevel saved listener state: `(toplevel_addr, orig_func, orig_data)`.
 static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -169,6 +180,8 @@ fn store_real(symbol: &str, ptr: *mut c_void) {
         "wl_display_dispatch_queue_pending" => &REAL_DISPATCH_QUEUE_PENDING,
         "wl_proxy_add_dispatcher" => &REAL_ADD_DISPATCHER,
         "wl_proxy_add_listener" => &REAL_ADD_LISTENER,
+        "poll" => &REAL_POLL,
+        "ppoll" => &REAL_PPOLL,
         _ => return,
     };
     target.store(ptr as usize, Ordering::SeqCst);
@@ -601,6 +614,155 @@ unsafe extern "C" fn hook_add_listener(
 }
 
 // ---------------------------------------------------------------------------
+// poll/ppoll hooks — eventfd wake for blocked dispatch loops
+// ---------------------------------------------------------------------------
+//
+// After the IPC thread queues a synthetic input command, a real app
+// blocked in poll(…, -1) will never wake — no Wayland event arrives,
+// so the dispatch hooks never drain the queue.  We hook poll and ppoll,
+// fold in an eventfd, and write to it from the IPC thread when a
+// command is queued.  The poll returns, the app's loop iterates, the
+// hooked dispatch_pending fires, and the queued input is delivered.
+
+/// Buffer size for the extended pollfd set.  32 fds is generous — most
+/// Wayland clients poll 1–2 fds.
+const POLL_BUF_CAP: usize = 32;
+
+unsafe extern "C" fn hook_poll(
+    fds: *mut libc::pollfd,
+    nfds: libc::nfds_t,
+    timeout: libc::c_int,
+) -> libc::c_int {
+    POLL_HOOK_COUNT.fetch_add(1, Ordering::Relaxed);
+    let in_nfds = nfds as usize;
+    let real_ptr = REAL_POLL.load(Ordering::SeqCst);
+    if real_ptr == 0 || in_nfds == 0 || in_nfds + 1 > POLL_BUF_CAP {
+        // Fall back to real poll via dlsym if the GOT patch didn't
+        // capture the real pointer, or if the fd set would overflow
+        // our stack buffer.
+        let real = libc::dlsym(libc::RTLD_DEFAULT, c"poll".as_ptr() as *const c_char);
+        let real_poll: extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
+            if real.is_null() {
+                return -1;
+            } else {
+                std::mem::transmute::<
+                    *mut c_void,
+                    extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int,
+                >(real)
+            };
+        return real_poll(fds, nfds, timeout);
+    }
+    let real_poll: extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
+        std::mem::transmute::<
+            usize,
+            extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int,
+        >(real_ptr);
+
+    let efd = WAKE_EVENTFD.load(Ordering::Acquire);
+    if efd < 0 {
+        return real_poll(fds, nfds, timeout);
+    }
+
+    let mut buf: [libc::pollfd; POLL_BUF_CAP] = std::mem::zeroed();
+    for (i, item) in buf.iter_mut().enumerate().take(in_nfds) {
+        *item = *fds.add(i);
+    }
+    buf[in_nfds].fd = efd;
+    buf[in_nfds].events = libc::POLLIN;
+
+    let ret = real_poll(buf.as_mut_ptr(), (in_nfds + 1) as libc::nfds_t, timeout);
+
+    // Copy revents back to caller's fds.
+    for (i, item) in buf.iter().enumerate().take(in_nfds) {
+        (*fds.add(i)).revents = item.revents;
+    }
+
+    if ret > 0 && (buf[in_nfds].revents & libc::POLLIN != 0) {
+        // Drain our eventfd and exclude it from the returned count.
+        let mut val: u64 = 0;
+        libc::read(efd, &raw mut val as *mut c_void, 8);
+        return ret - 1;
+    }
+    ret
+}
+
+unsafe extern "C" fn hook_ppoll(
+    fds: *mut libc::pollfd,
+    nfds: libc::nfds_t,
+    timeout: *const libc::timespec,
+    sigmask: *const libc::sigset_t,
+) -> libc::c_int {
+    let in_nfds = nfds as usize;
+    let real_ptr = REAL_PPOLL.load(Ordering::SeqCst);
+    if real_ptr == 0 || in_nfds == 0 || in_nfds + 1 > POLL_BUF_CAP {
+        let real = libc::dlsym(libc::RTLD_DEFAULT, c"ppoll".as_ptr() as *const c_char);
+        let real_ppoll: extern "C" fn(
+            *mut libc::pollfd,
+            libc::nfds_t,
+            *const libc::timespec,
+            *const libc::sigset_t,
+        ) -> libc::c_int = if real.is_null() {
+            return -1;
+        } else {
+            std::mem::transmute::<
+                *mut c_void,
+                extern "C" fn(
+                    *mut libc::pollfd,
+                    libc::nfds_t,
+                    *const libc::timespec,
+                    *const libc::sigset_t,
+                ) -> libc::c_int,
+            >(real)
+        };
+        return real_ppoll(fds, nfds, timeout, sigmask);
+    }
+    let real_ppoll: extern "C" fn(
+        *mut libc::pollfd,
+        libc::nfds_t,
+        *const libc::timespec,
+        *const libc::sigset_t,
+    ) -> libc::c_int = std::mem::transmute::<
+        usize,
+        extern "C" fn(
+            *mut libc::pollfd,
+            libc::nfds_t,
+            *const libc::timespec,
+            *const libc::sigset_t,
+        ) -> libc::c_int,
+    >(real_ptr);
+
+    let efd = WAKE_EVENTFD.load(Ordering::Acquire);
+    if efd < 0 {
+        return real_ppoll(fds, nfds, timeout, sigmask);
+    }
+
+    let mut buf: [libc::pollfd; POLL_BUF_CAP] = std::mem::zeroed();
+    for (i, item) in buf.iter_mut().enumerate().take(in_nfds) {
+        *item = *fds.add(i);
+    }
+    buf[in_nfds].fd = efd;
+    buf[in_nfds].events = libc::POLLIN;
+
+    let ret = real_ppoll(
+        buf.as_mut_ptr(),
+        (in_nfds + 1) as libc::nfds_t,
+        timeout,
+        sigmask,
+    );
+
+    for (i, item) in buf.iter().enumerate().take(in_nfds) {
+        (*fds.add(i)).revents = item.revents;
+    }
+
+    if ret > 0 && (buf[in_nfds].revents & libc::POLLIN != 0) {
+        let mut val: u64 = 0;
+        libc::read(efd, &raw mut val as *mut c_void, 8);
+        return ret - 1;
+    }
+    ret
+}
+
+// ---------------------------------------------------------------------------
 // GOT patching
 // ---------------------------------------------------------------------------
 
@@ -676,6 +838,15 @@ unsafe fn page_protection(addr: usize) -> Option<i32> {
 unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut c_void) {
     // Never patch libwayland-client itself — it *defines* these symbols.
     if path.contains("libwayland-client") {
+        return;
+    }
+    // Never patch our own payload — would create infinite recursion
+    // when we hook poll/ppoll (which we call internally).
+    if path.contains("backseat_payload") {
+        return;
+    }
+    // Never patch libc itself — it defines poll/ppoll.
+    if (symbol == "poll" || symbol == "ppoll") && path.contains("libc") {
         return;
     }
 
@@ -1079,6 +1250,21 @@ enum HandleResult {
     Response(String),
     Unload,
 }
+/// Push a command into the queue and wake any blocked poll() in the
+/// target's dispatch thread by writing to the eventfd and sending SIGUSR2.
+unsafe fn enqueue_command(cmd: IpcCommand) {
+    {
+        let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(cmd);
+    }
+    let efd = WAKE_EVENTFD.load(Ordering::Acquire);
+    if efd >= 0 {
+        let val: u64 = 1;
+        libc::write(efd, &val as *const u64 as *const c_void, 8);
+    }
+    libc::kill(libc::getpid(), libc::SIGUSR2);
+}
+
 fn parse_state(s: &str) -> u32 {
     match s {
         "pressed" => 1,
@@ -1102,45 +1288,30 @@ fn handle_request(line: &str) -> HandleResult {
         "mouse_move" => {
             let x = req.x.unwrap_or(0.0);
             let y = req.y.unwrap_or(0.0);
-            {
-                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                q.push_back(IpcCommand::MouseMove { x, y });
-            }
+            unsafe { enqueue_command(IpcCommand::MouseMove { x, y }); }
             HandleResult::Response(make_ok())
         }
         "mouse_button" => {
             let button = req.button.unwrap_or(0);
             let state = parse_state(&req.state.unwrap_or_default());
-            {
-                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                q.push_back(IpcCommand::MouseButton { button, state });
-            }
+            unsafe { enqueue_command(IpcCommand::MouseButton { button, state }); }
             HandleResult::Response(make_ok())
         }
         "key" => {
             let key = req.key.unwrap_or(0);
             let state = parse_state(&req.state.unwrap_or_default());
-            {
-                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                q.push_back(IpcCommand::Key { key, state });
-            }
+            unsafe { enqueue_command(IpcCommand::Key { key, state }); }
             HandleResult::Response(make_ok())
         }
         "modifiers" => {
             let depressed = req.depressed.unwrap_or(0);
-            {
-                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                q.push_back(IpcCommand::Modifiers { depressed });
-            }
+            unsafe { enqueue_command(IpcCommand::Modifiers { depressed }); }
             HandleResult::Response(make_ok())
         }
         "scroll" => {
             let axis = req.axis.unwrap_or(0);
             let amount = req.value.unwrap_or(0.0);
-            {
-                let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                q.push_back(IpcCommand::Scroll { axis, amount });
-            }
+            unsafe { enqueue_command(IpcCommand::Scroll { axis, amount }); }
             HandleResult::Response(make_ok())
         }
         "surface_size" => {
@@ -1356,6 +1527,11 @@ extern "C" fn init() {
             PROBE_FAILED.store(true, Ordering::Release);
             return;
         }
+        // Create the wake eventfd before patching — the poll hooks will
+        // read it.
+        let efd = libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
+        WAKE_EVENTFD.store(efd, Ordering::Release);
+
         patch_all_gots("wl_display_dispatch", hook_dispatch as *mut c_void);
         patch_all_gots(
             "wl_display_dispatch_pending",
@@ -1377,6 +1553,8 @@ extern "C" fn init() {
             "wl_proxy_add_listener",
             hook_add_listener as *mut c_void,
         );
+        patch_all_gots("poll", hook_poll as *mut c_void);
+        patch_all_gots("ppoll", hook_ppoll as *mut c_void);
     }
 }
 
