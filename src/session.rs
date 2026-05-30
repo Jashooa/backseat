@@ -361,7 +361,6 @@ impl Session {
     /// # Caveat
     ///
     /// The payload `.so` is *not* `dlclose`'d — the IPC thread would need to
-    /// shut down first and there is no portable way to wait for a thread in
     /// another process.  Re-injecting the same PID loads a second copy.
     pub async fn unload(self) -> Result<(), Error> {
         let mut s = self.stream.lock().await;
@@ -378,6 +377,17 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    /// Return a raw JSON status response from the payload.
+    ///
+    /// The response includes diagnostic fields (`poll_hits`, `eventfd`,
+    /// `has_poll_real`) that aren't captured by the standard `Response`
+    /// struct.  This is useful for debugging poll/ppoll hook behavior.
+    pub async fn status_raw(&self) -> Result<String, Error> {
+        let mut s = self.stream.lock().await;
+        send_line(&mut s, &Command::new("status")).await?;
+        read_line(&mut s).await
     }
 }
 
