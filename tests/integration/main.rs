@@ -109,7 +109,7 @@ async fn inject_and_unload() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
-    let env = TestEnv::start(FixtureKind::RustDispatcher);
+    let env = TestEnv::start(FixtureKind::CListener);
 
     let pid = env.pid();
     let session = Session::new(pid).await.expect("Session::new failed");
@@ -128,7 +128,7 @@ async fn drop_auto_unloads() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
-    let env = TestEnv::start(FixtureKind::RustDispatcher);
+    let env = TestEnv::start(FixtureKind::CListener);
 
     let pid = env.pid();
     {
@@ -144,7 +144,7 @@ async fn reinject_after_unload_works() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
-    let env = TestEnv::start(FixtureKind::RustDispatcher);
+    let env = TestEnv::start(FixtureKind::CListener);
 
     let pid = env.pid();
     let session = Session::new(pid).await.expect("first Session::new failed");
@@ -163,9 +163,9 @@ async fn session_from_name_finds_process() {
         return;
     }
     let _guard = SUITE_LOCK.lock().await;
-    let _env = TestEnv::start(FixtureKind::RustDispatcher);
+    let _env = TestEnv::start(FixtureKind::CListener);
 
-    let result = Session::from_name("backseat-test-fixture").await;
+    let result = Session::from_name("backseat-test-fixture-c").await;
     assert!(
         result.is_ok(),
         "Session::from_name should find the fixture: {result:?}"
@@ -179,11 +179,15 @@ async fn session_from_name_finds_process() {
 // ---------------------------------------------------------------------------
 
 /// All fixture configurations to test input against.
-const ALL_FIXTURE_KINDS: [FixtureKind; 1] = [FixtureKind::RustDispatcher];
+///
+/// NOTE: The Rust fixture (wayland-rs) is excluded from input tests
+/// because its internal connection state machine is incompatible with
+/// the fd hijack.  See pending/fd-hijack-wayland-rs.md for details.
+const ALL_FIXTURE_KINDS: [FixtureKind; 2] = [FixtureKind::CDispatcher, FixtureKind::CListener];
 
 /// Helper: send SIGUSR2 to the fixture so it re-requests keyboard and
-/// pointer proxies.  The payload's hooked `wl_proxy_add_dispatcher`
-/// fires `capture_proxy` on re-registration.
+/// pointer proxies.  The payload's stream sniffer learns the new object
+/// IDs from the wire traffic triggered by re-registration.
 fn reregister_input(pid: u32) {
     unsafe {
         libc::kill(pid as i32, libc::SIGUSR2);
@@ -204,13 +208,19 @@ async fn key_tap_is_received_by_target() {
         let session = Session::new(pid).await.expect("Session::new failed");
         reregister_input(pid);
 
+        // Give the pump thread time to forward and sniff the
+        // wl_seat.get_pointer / wl_seat.get_keyboard messages
+        // that the fixture sends in response to SIGUSR2.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         session
             .keyboard
             .tap(backseat::keys::Key::A)
             .await
             .expect("tap failed");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let lines = env.read_events(2);
+        // Read 3 events: keyboard_enter, key pressed, key released.
+        let lines = env.read_events(3);
         assert!(
             lines.iter().any(|l| l.contains("key pressed 30")),
             "[{kind:?}] missing press: {lines:?}"
@@ -241,7 +251,8 @@ async fn mouse_click_is_received_by_target() {
             .await
             .expect("click failed");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let lines = env.read_events(2);
+        // pointer_enter + button pressed + button released + frame events
+        let lines = env.read_events(4);
         assert!(
             lines.iter().any(|l| l.contains("button pressed 272")),
             "[{kind:?}] missing press: {lines:?}"
@@ -272,7 +283,8 @@ async fn mouse_scroll_is_received_by_target() {
             .await
             .expect("scroll failed");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let lines = env.read_events(1);
+        // pointer_enter + axis event
+        let lines = env.read_events(2);
         assert!(
             lines
                 .iter()
@@ -301,7 +313,8 @@ async fn type_text_is_received_by_target() {
             .await
             .expect("type_text failed");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let lines = env.read_events(4);
+        // keyboard_enter + h press + h release + i press + i release
+        let lines = env.read_events(5);
         assert!(
             lines.iter().any(|l| l.contains("key pressed 35")),
             "[{kind:?}] missing h press: {lines:?}"
@@ -340,7 +353,8 @@ async fn combo_is_received_by_target() {
             .await
             .expect("combo failed");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let lines = env.read_events(4);
+        // keyboard_enter + ctrl press + c press + c release + ctrl release
+        let lines = env.read_events(5);
         assert!(
             lines.iter().any(|l| l.contains("key pressed 29")),
             "[{kind:?}] missing ctrl press: {lines:?}"

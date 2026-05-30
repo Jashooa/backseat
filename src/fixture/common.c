@@ -166,6 +166,14 @@ void request_input_proxies(struct app_state *s)
     s->pointer  = wl_seat_get_pointer(s->seat);
     s->keyboard = wl_seat_get_keyboard(s->seat);
 
+    // Send a wl_surface.frame request to expose the surface ID on the wire.
+    // The wire-rewrite payload sniffs app→compositor traffic to learn
+    // object IDs; a frame request (opcode 3 on a wl_surface) lets the
+    // sniffer identify the surface ID.
+    if (s->surface) {
+        wl_surface_frame(s->surface);
+    }
+
     if (s->mode == FIXTURE_LISTENER) {
         // Listener registration happens later — after the payload
         // hooks wl_proxy_add_listener, it needs to fire again.

@@ -10,20 +10,15 @@ fn main() {
 
     // Re-run whenever the vendored payload source changes.
     let vendored_src = manifest_dir.join("src").join("payload").join("lib.rs");
-    let shim_src_rerun = manifest_dir.join("src").join("payload").join("shim.c");
     println!("cargo:rerun-if-changed={}", vendored_src.display());
-    println!("cargo:rerun-if-changed={}", shim_src_rerun.display());
     println!("cargo:rerun-if-changed=build.rs");
-
-    // Force lazy PLT binding so the ptrace-injected payload can interpose
-    // libwayland-client symbols in the test fixture.
-    println!("cargo:rustc-link-arg=-Wl,-z,lazy");
 
     let vendored_project = out_dir.join("payload-project");
     let vendored_src_dir = vendored_project.join("src");
     std::fs::create_dir_all(&vendored_src_dir).expect("failed to create payload src dir");
 
     // Minimal Cargo.toml — the payload has few deps and they're stable.
+    // No goblin, no C shim — the wire rewrite eliminates GOT patching.
     let cargo_toml = r#"[workspace]
 
 [package]
@@ -36,7 +31,6 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-goblin = "0.10"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,27 +42,6 @@ serde_json = "1"
     // Copy the vendored source.
     std::fs::copy(&vendored_src, vendored_src_dir.join("lib.rs"))
         .expect("failed to copy payload source");
-
-    // Compile the C shim for sigsetjmp/siglongjmp and link it into
-    // the payload via its own build.rs — RUSTFLAGS isn't reliable
-    // because cargo may override it from the environment.
-    let shim_src = manifest_dir.join("src").join("payload").join("shim.c");
-    let shim_obj = vendored_project.join("shim.o");
-    let shim_cc = Command::new("cc")
-        .arg("-c")
-        .arg(&shim_src)
-        .args(["-o", shim_obj.to_str().unwrap()])
-        .status()
-        .expect("failed to compile payload C shim");
-    if !shim_cc.success() {
-        panic!("payload C shim compilation failed");
-    }
-    let vendored_build_rs = vendored_project.join("build.rs");
-    let vincantation = format!(
-        r#"fn main() {{ println!("cargo:rustc-link-arg={}"); }}"#,
-        shim_obj.display()
-    );
-    std::fs::write(&vendored_build_rs, vincantation).expect("failed to write vendored build.rs");
 
     let mut cmd = Command::new("cargo");
     cmd.args(["build", "--target", &target]);

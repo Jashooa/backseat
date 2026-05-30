@@ -106,8 +106,11 @@ pub(crate) struct Response {
     pub(crate) message: Option<String>,
     #[serde(default)]
     pub(crate) kind: Option<String>,
-    #[serde(default, rename = "dispatch_hook_installed")]
-    pub(crate) _dispatch_hook_installed: Option<bool>,
+    // Wire-rewrite status fields (the pump/sniffer replaces dispatch hooks).
+    #[serde(default, rename = "pump_running")]
+    pub(crate) _pump_running: Option<bool>,
+    #[serde(default, rename = "hijack_ok")]
+    pub(crate) _hijack_ok: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,10 +325,8 @@ impl Session {
             }
         }
 
-        // Query status for debugging, but do NOT fail if the dispatch hook
-        // hasn't fired yet — the target may not have called
-        // wl_display_dispatch since injection.  The only definitive test is
-        // G_DISPATCH_CALLED, which is set lazily inside run_hooks.
+        // Query status for debugging — the payload reports pump_running,
+        // hijack_ok, and object discovery progress.
         {
             let mut s = stream.lock().await;
             send_line(&mut s, &Command::new("status")).await?;
@@ -381,9 +382,9 @@ impl Session {
 
     /// Return a raw JSON status response from the payload.
     ///
-    /// The response includes diagnostic fields (`poll_hits`, `eventfd`,
-    /// `has_poll_real`) that aren't captured by the standard `Response`
-    /// struct.  This is useful for debugging poll/ppoll hook behavior.
+    /// The response includes diagnostic fields (`pump_running`,
+    /// `pointer_id`, `keyboard_id`, `surface_id`, `hijack_ok`) that
+    /// aren't fully captured by the standard `Response` struct.
     pub async fn status_raw(&self) -> Result<String, Error> {
         let mut s = self.stream.lock().await;
         send_line(&mut s, &Command::new("status")).await?;
@@ -636,10 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn response_deserialization_status_with_dispatch_hook() {
-        let json = r#"{"status":"ok","dispatch_hook_installed":false}"#;
+    fn response_deserialization_status_with_pump_running() {
+        let json = r#"{"status":"ok","pump_running":true,"hijack_ok":true}"#;
         let resp: Response = serde_json::from_str(json).unwrap();
-        assert_eq!(resp._dispatch_hook_installed, Some(false));
+        assert_eq!(resp._pump_running, Some(true));
+        assert_eq!(resp._hijack_ok, Some(true));
     }
 
     #[test]

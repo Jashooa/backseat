@@ -3,1359 +3,1179 @@
 //! This crate is compiled as a `cdylib` and injected into a target process via
 //! `dlopen`. Once loaded, it:
 //!
-//! 1. Patches the GOT entries of the target executable (and all loaded
-//!    libraries) for `wl_display_dispatch*` functions to point to our hooks.
-//! 2. Scans libwayland's internal proxy table to capture existing proxies.
-//! 3. Spawns an IPC thread listening on a per-PID Unix socket.
-//! 4. Queues synthetic input commands received over the IPC socket and
-//!    dispatches them inside the app's natural dispatch calls.
+//! 1. Finds the target's Wayland socket fd and inserts itself as a
+//!    transparent proxy via socketpair MITM.
+//! 2. Spawns a pump thread that forwards traffic bidirectionally between
+//!    the app and the real compositor, preserving ancillary `SCM_RIGHTS`
+//!    fd data (shm pools, dmabuf).
+//! 3. Sniffs the forwarded wire traffic to learn object IDs (wl_pointer,
+//!    wl_keyboard, wl_surface) and serials.
+//! 4. Spawns an IPC thread listening on a per-PID Unix socket.
+//! 5. Encodes synthetic input as correct Wayland wire messages and injects
+//!    them into the app's read side — letting *its* libwayland do the
+//!    ABI-correct dispatch.
+//!
+//! # Architecture decision
+//!
+//! We no longer patch GOT entries, walk wl_map internals, or call listener
+//! vtable functions by hand.  Those operations depend on private libwayland
+//! struct layouts that change across distro releases.  Instead we sit on the
+//! wire — the only stable ABI Wayland has — and feed the app's own
+//! libwayland correctly-encoded messages.
 
-use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::io::{BufRead, Write};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
-// libwayland internal structures (ABI-stable across libwayland 1.x)
+// Wire encoding — Little-endian Wayland wire protocol messages
 // ---------------------------------------------------------------------------
 //
-// These mirrors are validated at compile time via offset_of! assertions.
-// A distro libwayland bump that changes any of these layouts will be caught
-// as a build error rather than a silent runtime corruption.
-
-// Compile-time layout assertions — catch ABI drift before it becomes a
-// runtime segfault.
-const _: () = assert!(core::mem::offset_of!(wl_proxy, object) == 0);
-const _: () = assert!(core::mem::offset_of!(wl_proxy, queue) == 32);
-const _: () = assert!(core::mem::offset_of!(wl_proxy, queue_link) == 80);
-const _: () = assert!(core::mem::size_of::<wl_proxy>() == 96);
-const _: () = assert!(core::mem::offset_of!(wl_event_queue, proxy_list) == 16);
-const _: () = assert!(core::mem::offset_of!(wl_display_header, objects) == 144);
-const _: () = assert!(core::mem::size_of::<wl_map>() == 56);
-
-#[repr(C)]
-struct wl_list {
-    prev: *mut wl_list,
-    next: *mut wl_list,
-}
-
-#[repr(C)]
-struct wl_array {
-    size: usize,
-    alloc: usize,
-    data: *mut c_void,
-}
-
-#[repr(C)]
-pub struct wl_interface {
-    name: *const c_char,
-    version: c_int,
-    method_count: c_int,
-    methods: *const c_void,
-    event_count: c_int,
-    events: *const c_void,
-}
-
-#[repr(C)]
-struct wl_object {
-    interface: *const wl_interface,
-    implementation: *const c_void,
-    id: u32,
-    _pad: u32,
-}
-
-#[repr(C)]
-struct wl_proxy {
-    object: wl_object,
-    display: *mut c_void,
-    queue: *mut c_void,
-    flags: u32,
-    refcount: c_int,
-    user_data: *mut c_void,
-    dispatcher: *mut c_void,
-    version: u32,
-    _pad: u32,
-    tag: *const *const c_char,
-    queue_link: wl_list,
-}
-
-#[repr(C)]
-struct wl_event_queue {
-    event_list: wl_list,
-    proxy_list: wl_list,
-    display: *mut c_void,
-    name: *mut c_char,
-}
-
-#[repr(C)]
-struct wl_map {
-    client_entries: wl_array,
-    server_entries: wl_array,
-    side: u32,
-    free_list: u32,
-}
-
-#[repr(C)]
-struct wl_display_header {
-    proxy: wl_proxy,
-    connection: *mut c_void,
-    last_error: c_int,
-    /// Opaque blob covering the anonymous `protocol_error` substruct.
-    /// The C layout is `{ uint32_t code; const wl_interface *interface;
-    /// uint32_t id; }` with inter-field padding.  Using an opaque blob
-    /// avoids mirroring the exact field order, which is easy to get
-    /// wrong and harmless since we only access `objects` below.
-    _protocol_error: [u8; 28],
-    fd: c_int,
-    _pad4: u32,
-    objects: wl_map,
-    display_queue: wl_event_queue,
-    // default_queue follows but we don't need it
-}
-
-// ---------------------------------------------------------------------------
-// Globals
-// ---------------------------------------------------------------------------
-
-static G_POINTER: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static G_KEYBOARD: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static G_SEAT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static G_XDG_TOPLEVEL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static G_SURFACE_W: AtomicU32 = AtomicU32::new(0);
-static G_SURFACE_H: AtomicU32 = AtomicU32::new(0);
-static G_DISPATCH_CALLED: AtomicBool = AtomicBool::new(false);
-static G_INITIAL_SWEEP_DONE: AtomicBool = AtomicBool::new(false);
-static G_HOST_PID: AtomicU32 = AtomicU32::new(0);
-static COMMAND_QUEUE: Mutex<VecDeque<IpcCommand>> = Mutex::new(VecDeque::new());
-static IPC_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
-
-// Stored real function pointers (saved before GOT patching).
-static REAL_DISPATCH: AtomicUsize = AtomicUsize::new(0);
-static REAL_DISPATCH_PENDING: AtomicUsize = AtomicUsize::new(0);
-static REAL_DISPATCH_QUEUE: AtomicUsize = AtomicUsize::new(0);
-static REAL_DISPATCH_QUEUE_PENDING: AtomicUsize = AtomicUsize::new(0);
-static REAL_ADD_DISPATCHER: AtomicUsize = AtomicUsize::new(0);
-static REAL_ADD_LISTENER: AtomicUsize = AtomicUsize::new(0);
-static REAL_POLL: AtomicUsize = AtomicUsize::new(0);
-static REAL_PPOLL: AtomicUsize = AtomicUsize::new(0);
-
-/// Eventfd written by the IPC thread after queuing a command.
-/// The poll/ppoll hook adds this fd to the poll set so that any
-/// blocked poll() in the target wakes and the dispatch hooks drain
-/// the command queue.
-static WAKE_EVENTFD: AtomicI32 = AtomicI32::new(-1);
-
-/// Number of times the poll hook has been invoked (diagnostic).
-static POLL_HOOK_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// Per-toplevel saved listener state: `(toplevel_addr, orig_func, orig_data)`.
-static TOPLEVEL_LISTENERS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-unsafe fn proxy_interface_name(proxy: *mut c_void) -> Option<&'static [u8]> {
-    let p = proxy as *mut wl_proxy;
-    let iface = (*p).object.interface;
-    if iface.is_null() {
-        return None;
-    }
-    let name = (*iface).name;
-    if name.is_null() {
-        return None;
-    }
-    Some(CStr::from_ptr(name).to_bytes())
-}
-
-fn store_real(symbol: &str, ptr: *mut c_void) {
-    let target = match symbol {
-        "wl_display_dispatch" => &REAL_DISPATCH,
-        "wl_display_dispatch_pending" => &REAL_DISPATCH_PENDING,
-        "wl_display_dispatch_queue" => &REAL_DISPATCH_QUEUE,
-        "wl_display_dispatch_queue_pending" => &REAL_DISPATCH_QUEUE_PENDING,
-        "wl_proxy_add_dispatcher" => &REAL_ADD_DISPATCHER,
-        "wl_proxy_add_listener" => &REAL_ADD_LISTENER,
-        "poll" => &REAL_POLL,
-        "ppoll" => &REAL_PPOLL,
-        _ => return,
-    };
-    target.store(ptr as usize, Ordering::SeqCst);
-}
-
-// ---------------------------------------------------------------------------
-// Sigsetjmp guard — catches SIGSEGV / SIGBUS in capture_proxy
-// ---------------------------------------------------------------------------
+// Message = header + args, all little-endian u32 words:
+//   header: [u32 object_id, u32 size_opcode]
+//     size_opcode = (total_size_in_bytes << 16) | opcode
+//     total_size includes the 8-byte header
+//   args:   uint/int/fixed/object/new_id = 1 word each
+//           string = u32 len(incl NUL) + data padded to 4
+//           array  = u32 len + data padded to 4
+//           fd     = ancillary (not in byte stream)
 //
-// The initial_sweep wl_map walk can encounter entries pointing to freed
-// proxy memory.  capture_proxy dereferences proxy → object.interface →
-// interface.name → CStr::from_ptr (strlen), a 3-link chain where any
-// link can be garbage.  A single-byte is_mapped probe can't protect
-// against strlen running off a mapped page into unmapped territory.
-//
-// We wrap capture_proxy in sigsetjmp/siglongjmp: if the deref chain
-// faults, the handler longjmps out, the entry is skipped, and the sweep
-// continues.
-//
-// __sigsetjmp is called directly from try_capture's frame so the saved
-// context remains alive across capture_proxy (unlike wrapping it in a
-// helper function, whose frame dies on return — POSIX requires the
-// setjmp frame to still be active at longjmp time).
+// wl_fixed = 24.8 fixed point: fixed = round(double * 256.0)
 
-extern "C" {
-    fn __sigsetjmp(buf: *mut c_void, savesigs: std::ffi::c_int) -> std::ffi::c_int;
-    fn sj_longjmp(buf: *mut c_void, val: std::ffi::c_int) -> !;
-    fn patch_gots_via_phdrs(symbol: *const std::ffi::c_char, hook: *mut c_void);
+/// Build a wayland message header (2 u32 words).
+/// `object_id`: target object on the wire.
+/// `opcode`: event/request opcode.
+/// `body_words`: number of u32 argument words (NOT counting the 2 header words).
+fn wire_header(object_id: u32, opcode: u16, body_words: u32) -> [u32; 2] {
+    let total_bytes = 8 + body_words * 4;
+    let size_opcode = (total_bytes << 16) | (opcode as u32);
+    [object_id, size_opcode]
 }
 
-/// Over-sized, 16-byte-aligned buffer for sigjmp_buf.
-/// glibc x86-64 sigjmp_buf is ~200 bytes; 256 bytes is safe.
-#[repr(align(16))]
+/// Write a u32 word to a byte buffer (little-endian).
+fn push_u32(buf: &mut Vec<u8>, val: u32) {
+    buf.extend_from_slice(&val.to_le_bytes());
+}
+
+/// Write a wl_fixed value (24.8 fixed point from f64).
+fn push_fixed(buf: &mut Vec<u8>, val: f64) {
+    push_u32(buf, to_fixed(val) as u32);
+}
+
+/// Write a string argument: 4-byte length prefix (incl NUL), NUL-terminated
+/// data, 4-byte padded.
 #[allow(dead_code)]
-struct JmpBuf([u64; 32]);
-
-/// Single jmp_buf shared by try_capture (setjmp) and sweep_sig_handler
-/// (longjmp).  Module-level so both functions see the same buffer.
-static mut BUF: JmpBuf = JmpBuf([0; 32]);
-
-static SWEEP_ARMED: AtomicBool = AtomicBool::new(false);
-static SWEEP_SKIPPED: AtomicUsize = AtomicUsize::new(0);
-
-/// Signal handler installed around the sweep.  If ARMED, longjmps
-/// back to try_capture; otherwise restores the app's old handler and
-/// re-raises the signal so the app's own crash handling runs.
-unsafe extern "C" fn sweep_sig_handler(sig: i32) {
-    if SWEEP_ARMED.load(Ordering::Relaxed) {
-        SWEEP_SKIPPED.fetch_add(1, Ordering::Relaxed);
-        sj_longjmp((&raw mut BUF) as *mut c_void, 1);
-    }
-    // Not armed — forward to the app's handler.
-    let old = match sig {
-        libc::SIGSEGV => &raw const SAVED_OLD_SEGV,
-        libc::SIGBUS => &raw const SAVED_OLD_BUS,
-        _ => return,
-    };
-    unsafe {
-        libc::sigaction(sig, old, std::ptr::null_mut());
-        libc::raise(sig);
+fn push_string(buf: &mut Vec<u8>, s: &str) {
+    let len_with_nul = (s.len() + 1) as u32;
+    push_u32(buf, len_with_nul);
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(0u8); // NUL terminator
+    let padded_len = len_with_nul.div_ceil(4) * 4;
+    for _ in len_with_nul..padded_len {
+        buf.push(0u8);
     }
 }
 
-/// Guard a single capture_proxy call with sigsetjmp/siglongjmp.
-/// Returns true if capture succeeded without faulting.
-///
-/// __sigsetjmp is called here (not through a helper) so its frame is
-/// try_capture's, which stays alive across the capture_proxy call.
-unsafe fn try_capture(proxy: *mut c_void) -> bool {
-    SWEEP_ARMED.store(true, Ordering::Release);
-    if __sigsetjmp((&raw mut BUF) as *mut c_void, 1) == 0 {
-        capture_proxy(proxy);
-        SWEEP_ARMED.store(false, Ordering::Release);
-        true
-    } else {
-        SWEEP_ARMED.store(false, Ordering::Release);
-        false
+/// Write an array argument: 4-byte length prefix, data, 4-byte padded.
+fn push_array(buf: &mut Vec<u8>, data: &[u8]) {
+    let len = data.len() as u32;
+    push_u32(buf, len);
+    buf.extend_from_slice(data);
+    let padded_len = len.div_ceil(4) * 4;
+    for _ in len..padded_len {
+        buf.push(0u8);
     }
 }
 
-/// Saved old sigactions for SIGSEGV and SIGBUS — restored when our
-/// handler fires while ARMED is false (the app's own crash).
-static mut SAVED_OLD_SEGV: libc::sigaction = unsafe { std::mem::zeroed() };
-static mut SAVED_OLD_BUS: libc::sigaction = unsafe { std::mem::zeroed() };
-
-/// Install our SIGSEGV/SIGBUS handlers via sigaction, saving the old
-/// ones for proper restore.  sigaction preserves SA_SIGINFO/SA_ONSTACK
-/// flags that libc::signal() cannot represent.
-unsafe fn install_guard() {
-    let newact = libc::sigaction {
-        sa_sigaction: sweep_sig_handler as *const () as usize,
-        sa_mask: std::mem::zeroed(),
-        sa_flags: libc::SA_NODEFER,
-        sa_restorer: None,
-    };
-    libc::sigaction(
-        libc::SIGSEGV,
-        &newact,
-        &raw mut SAVED_OLD_SEGV,
-    );
-    libc::sigaction(
-        libc::SIGBUS,
-        &newact,
-        &raw mut SAVED_OLD_BUS,
-    );
+/// Encode `wl_pointer.enter(serial, surface, x, y)` → opcode 0.
+/// Returns the complete wire message bytes (header + args).
+fn encode_pointer_enter(object_id: u32, serial: u32, surface: u32, x: f64, y: f64) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 0, 4);
+    let mut buf = Vec::with_capacity(24);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, serial);
+    push_u32(&mut buf, surface);
+    push_fixed(&mut buf, x);
+    push_fixed(&mut buf, y);
+    buf
 }
 
-unsafe fn uninstall_guard() {
-    libc::sigaction(
-        libc::SIGSEGV,
-        &raw const SAVED_OLD_SEGV,
-        std::ptr::null_mut(),
-    );
-    libc::sigaction(
-        libc::SIGBUS,
-        &raw const SAVED_OLD_BUS,
-        std::ptr::null_mut(),
-    );
+/// Encode `wl_pointer.leave(serial, surface)` → opcode 1.
+#[allow(dead_code)]
+fn encode_pointer_leave(object_id: u32, serial: u32, surface: u32) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 1, 2);
+    let mut buf = Vec::with_capacity(16);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, serial);
+    push_u32(&mut buf, surface);
+    buf
 }
 
-/// Wrapper around the entire sweep that installs/removes the guard.
-unsafe fn guarded_sweep(display: *mut c_void) {
-    install_guard();
-    initial_sweep(display);
-    uninstall_guard();
-    let skipped = SWEEP_SKIPPED.swap(0, Ordering::Relaxed);
-    if skipped > 0 {
-        // We don't have stderr access safely; just silently drop.
-    }
+/// Encode `wl_pointer.motion(time, x, y)` → opcode 2.
+fn encode_pointer_motion(object_id: u32, time: u32, x: f64, y: f64) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 2, 3);
+    let mut buf = Vec::with_capacity(20);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, time);
+    push_fixed(&mut buf, x);
+    push_fixed(&mut buf, y);
+    buf
+}
+
+/// Encode `wl_pointer.button(serial, time, button, state)` → opcode 3.
+fn encode_pointer_button(
+    object_id: u32,
+    serial: u32,
+    time: u32,
+    button: u32,
+    state: u32,
+) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 3, 4);
+    let mut buf = Vec::with_capacity(24);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, serial);
+    push_u32(&mut buf, time);
+    push_u32(&mut buf, button);
+    push_u32(&mut buf, state);
+    buf
+}
+
+/// Encode `wl_pointer.axis(time, axis, value)` → opcode 4.
+fn encode_pointer_axis(object_id: u32, time: u32, axis: u32, value: f64) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 4, 3);
+    let mut buf = Vec::with_capacity(20);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, time);
+    push_u32(&mut buf, axis);
+    push_fixed(&mut buf, value);
+    buf
+}
+
+/// Encode `wl_pointer.frame()` → opcode 5.
+fn encode_pointer_frame(object_id: u32) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 5, 0);
+    let mut buf = Vec::with_capacity(8);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    buf
+}
+
+/// Encode `wl_keyboard.enter(serial, surface, keys)` → opcode 1.
+/// `keys` is an array of u32 keycodes.
+fn encode_keyboard_enter(object_id: u32, serial: u32, surface: u32, keys: &[u32]) -> Vec<u8> {
+    let keys_bytes: Vec<u8> = keys
+        .iter()
+        .flat_map(|k| k.to_le_bytes())
+        .collect();
+    let array_words = (keys_bytes.len() / 4) as u32;
+    // header(2) + serial(1) + surface(1) + array_len(1) + array_body
+    let body_words = 1 + 1 + 1 + array_words;
+    let [h0, h1] = wire_header(object_id, 1, body_words);
+    let mut buf = Vec::with_capacity(8 + (body_words * 4) as usize);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, serial);
+    push_u32(&mut buf, surface);
+    push_array(&mut buf, &keys_bytes);
+    buf
+}
+
+/// Encode `wl_keyboard.leave(serial, surface)` → opcode 2.
+#[allow(dead_code)]
+fn encode_keyboard_leave(object_id: u32, serial: u32, surface: u32) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 2, 2);
+    let mut buf = Vec::with_capacity(16);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, serial);
+    push_u32(&mut buf, surface);
+    buf
+}
+
+/// Encode `wl_keyboard.key(serial, time, key, state)` → opcode 3.
+fn encode_keyboard_key(object_id: u32, serial: u32, time: u32, key: u32, state: u32) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 3, 4);
+    let mut buf = Vec::with_capacity(24);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, serial);
+    push_u32(&mut buf, time);
+    push_u32(&mut buf, key);
+    push_u32(&mut buf, state);
+    buf
+}
+
+/// Encode `wl_keyboard.modifiers(serial, depressed, latched, locked, group)` → opcode 4.
+fn encode_keyboard_modifiers(
+    object_id: u32,
+    serial: u32,
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+) -> Vec<u8> {
+    let [h0, h1] = wire_header(object_id, 4, 5);
+    let mut buf = Vec::with_capacity(28);
+    push_u32(&mut buf, h0);
+    push_u32(&mut buf, h1);
+    push_u32(&mut buf, serial);
+    push_u32(&mut buf, depressed);
+    push_u32(&mut buf, latched);
+    push_u32(&mut buf, locked);
+    push_u32(&mut buf, group);
+    buf
 }
 
 // ---------------------------------------------------------------------------
-// Proxy capture
+// Wire message parser — for sniffing traffic to learn object IDs & serials
 // ---------------------------------------------------------------------------
 
-unsafe fn capture_proxy(proxy: *mut c_void) {
-    if let Some(name) = proxy_interface_name(proxy) {
-        match name {
-            b"wl_seat" => G_SEAT.store(proxy, Ordering::Release),
-            b"wl_pointer" => G_POINTER.store(proxy, Ordering::Release),
-            b"wl_keyboard" => G_KEYBOARD.store(proxy, Ordering::Release),
-            b"xdg_toplevel" => {
-                G_XDG_TOPLEVEL.store(proxy, Ordering::Release);
-                install_toplevel_shim(proxy);
+/// A parsed Wayland wire message (header + raw args).
+#[derive(Debug, Clone)]
+struct WireMessage {
+    object_id: u32,
+    opcode: u16,
+    /// Raw u32 argument words (NOT including the 2 header words).
+    args: Vec<u32>,
+    /// Total message size in bytes (including header), as declared in the header.
+    size_bytes: u32,
+}
+
+/// Parse a single Wayland message from a byte slice.
+/// Returns the message and the number of bytes consumed.
+/// Returns `None` if the data doesn't contain a complete message.
+fn parse_message(data: &[u8]) -> Option<(WireMessage, usize)> {
+    if data.len() < 8 {
+        return None;
+    }
+    let object_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let size_opcode = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let size_bytes = size_opcode >> 16;
+    let opcode = (size_opcode & 0xFFFF) as u16;
+
+    if !(8..=0x10000).contains(&size_bytes) {
+        // Bogus size — skip this message.
+        return None;
+    }
+    let total = size_bytes as usize;
+    if data.len() < total {
+        return None;
+    }
+
+    let arg_words = (total - 8) / 4;
+    let mut args = Vec::with_capacity(arg_words);
+    for i in 0..arg_words {
+        let off = 8 + i * 4;
+        args.push(u32::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+        ]));
+    }
+
+    Some((
+        WireMessage {
+            object_id,
+            opcode,
+            args,
+            size_bytes,
+        },
+        total,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Stream sniffer — learns object IDs and serials from wire traffic
+// ---------------------------------------------------------------------------
+
+/// What we know about an object discovered on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+enum ObjectKind {
+    WlPointer,
+    WlKeyboard,
+    WlSurface,
+    WlSeat,
+}
+
+/// Sniffer state: maps object_id → known type, tracks serials and surface.
+struct Sniffer {
+    /// Known object types (learned from wire traffic).
+    objects: std::collections::HashMap<u32, ObjectKind>,
+    /// Pointer object ID (if known).
+    pointer_id: Option<u32>,
+    /// Keyboard object ID (if known).
+    keyboard_id: Option<u32>,
+    /// Main surface object ID (if known).
+    surface_id: Option<u32>,
+    /// Seat object ID (if known).
+    seat_id: Option<u32>,
+    /// Latest serial seen from compositor events.
+    last_server_serial: u32,
+    /// Pointer version (inferred from traffic).
+    pointer_version: u32,
+    /// Pending bind: when we see a client request with opcode 0 and 1 arg (new_id),
+    /// we record (from_object_id, new_id).  If we then see opcode 1 with 1 arg on
+    /// the same from_object_id, that's seat.get_pointer + seat.get_keyboard.
+    pending_bind: Option<(u32, u32)>,
+}
+
+impl Sniffer {
+    fn new() -> Self {
+        Self {
+            objects: std::collections::HashMap::new(),
+            pointer_id: None,
+            keyboard_id: None,
+            surface_id: None,
+            seat_id: None,
+            last_server_serial: 0,
+            pointer_version: 5,
+            pending_bind: None,
+        }
+    }
+
+    /// Feed a message travelling *from the compositor to the app* (events).
+    /// Learn object types from opcode patterns.
+    fn feed_server_event(&mut self, msg: &WireMessage) {
+        // Track serial from any event that carries one as the first arg.
+        // Most Wayland events that carry a serial have it as arg[0].
+        if !msg.args.is_empty() {
+            self.last_server_serial = self.last_server_serial.max(msg.args[0]);
+        }
+
+        match msg.opcode {
+            // opcode 2: wl_pointer.motion — uniquely identifies pointer.
+            // wl_keyboard has no opcode 2 event (keyboard opcodes: 0=keymap, 1=enter, 2=leave,
+            // 3=key, 4=modifiers).  wl_pointer.leave is opcode 1, so opcode 2 is
+            // unambiguously wl_pointer.motion.
+            2 => {
+                self.set_object(msg.object_id, ObjectKind::WlPointer);
+            }
+            // opcode 5: wl_pointer.frame — uniquely identifies pointer (keyboard has no opcode 5).
+            5 => {
+                self.set_object(msg.object_id, ObjectKind::WlPointer);
+                self.pointer_version = self.pointer_version.max(5);
+            }
+            // opcode 0 or 1: ambiguous, but we check the size.
+            // wl_pointer.enter(serial, surface, x, y) = 4 args = 24 bytes
+            // wl_pointer.leave(serial, surface) = 2 args = 16 bytes
+            // wl_keyboard.enter(serial, surface, keys) = 3+ args = 20+ bytes (varies with keys)
+            // wl_surface.enter(output) = 1 arg = 12 bytes
+            // wl_seat.capabilities(caps) = 1 arg = 12 bytes
+            // wl_callback.done(data) = 1 arg = 12 bytes
+            0 => {
+                if msg.size_bytes == 24 {
+                    // 8 header + 4×4 args: serial, surface, x, y → wl_pointer.enter
+                    self.set_object(msg.object_id, ObjectKind::WlPointer);
+                    if msg.args.len() >= 2 {
+                        self.set_object(msg.args[1], ObjectKind::WlSurface);
+                    }
+                } else if msg.size_bytes == 12 && !msg.args.is_empty() && !self.objects.contains_key(&msg.object_id) {
+                    // Could be wl_seat.capabilities or wl_callback.done.
+                    // If the caps value looks like a valid seat capability mask (bits 0-3),
+                    // treat it as a seat.  This is a heuristic; wl_callback.done's data
+                    // is client-defined and could be anything.
+                    let caps = msg.args[0];
+                    // wl_seat.capability bits: pointer=1, keyboard=2, touch=4
+                    if caps > 0 && caps <= 7 {
+                        self.set_object(msg.object_id, ObjectKind::WlSeat);
+                    }
+                }
+            }
+            1 => {
+                if msg.size_bytes >= 20 {
+                    // wl_keyboard.enter: 8 header + serial(4) + surface(4) +
+                    // keys array len(4) + keys data = 20+ bytes.
+                    // Distinguish from wl_pointer.leave (size=16).
+                    self.set_object(msg.object_id, ObjectKind::WlKeyboard);
+                    if msg.args.len() >= 2 {
+                        self.set_object(msg.args[1], ObjectKind::WlSurface);
+                    }
+                }
+            }
+            // opcode 4: wl_pointer.axis (size=20, 3 args) vs wl_keyboard.modifiers (size=28, 5 args).
+            4 => {
+                if msg.size_bytes == 20 {
+                    self.set_object(msg.object_id, ObjectKind::WlPointer);
+                } else if msg.size_bytes == 28 {
+                    self.set_object(msg.object_id, ObjectKind::WlKeyboard);
+                }
+            }
+            // opcode 3: can be wl_pointer.button or wl_keyboard.key — indistinguishable by wire
+            // alone.  We rely on the object already being identified via other opcodes.
+            3 => {
+                if !self.objects.contains_key(&msg.object_id)
+                    && self.pointer_id.is_some_and(|p| p != msg.object_id)
+                {
+                    self.set_object(msg.object_id, ObjectKind::WlKeyboard);
+                }
             }
             _ => {}
         }
     }
-}
 
-unsafe fn install_toplevel_shim(toplevel: *mut c_void) {
-    let proxy = toplevel as *mut wl_proxy;
-
-    // Dispatcher proxies store a sentinel (&RUST_MANAGED) in
-    // object.implementation, not a listener table.  Writing to that
-    // address would corrupt the wayland-backend static.
-    if !(*proxy).dispatcher.is_null() {
-        return;
-    }
-
-    let impl_ptr = (*proxy).object.implementation as *mut usize;
-    if impl_ptr.is_null() {
-        return;
-    }
-    let orig_configure = *impl_ptr;
-    if orig_configure == 0 {
-        return;
-    }
-    // For listener-style proxies the vtable is at impl_ptr (configure,
-    // close, configure_bounds, wm_capabilities).  The user data lives
-    // in (*proxy).user_data, NOT in impl_ptr[1] which is the 'close'
-    // function pointer.  Using impl_ptr[1] would pass a function
-    // pointer as the user-data argument to the original configure
-    // callback, crashing GTK / Qt / raw C clients.
-    let user_data = (*proxy).user_data as usize;
-
-    let mut listeners = TOPLEVEL_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
-    let key = toplevel as usize;
-    if listeners.iter().any(|(k, _, _)| *k == key) {
-        return;
-    }
-    listeners.push((key, orig_configure, user_data));
-
-    // Only overwrite the configure slot — leave the rest of the
-    // listener vtable (close, configure_bounds, wm_capabilities)
-    // untouched so the app's other callbacks still fire.
-    *impl_ptr = toplevel_configure_shim as *const () as usize;
-}
-
-extern "C" fn toplevel_configure_shim(
-    _data: *mut c_void,
-    toplevel: *mut c_void,
-    width: i32,
-    height: i32,
-    states: *mut c_void,
-) {
-    G_SURFACE_W.store(width as u32, Ordering::Release);
-    G_SURFACE_H.store(height as u32, Ordering::Release);
-
-    let key = toplevel as usize;
-    let listeners = TOPLEVEL_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, orig_func, orig_data)) = listeners.iter().find(|(k, _, _)| *k == key) {
-        let func: extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void) =
-            unsafe { std::mem::transmute(*orig_func) };
-        func(*orig_data as *mut c_void, toplevel, width, height, states);
-    }
-}
-
-
-unsafe fn initial_sweep(display: *mut c_void) {
-    // Run a roundtrip to let libwayland drain any pending sync
-    // callbacks.  wl_display.sync creates temporary proxy objects
-    // whose entries survive in the wl_map until the callback fires
-    // and the object is destroyed.
-    //
-    // G_INITIAL_SWEEP_DONE is already set to true by run_hooks
-    // before calling us, so nested dispatch hooks from this roundtrip
-    // will re-enter run_hooks, see DONE=true, and return immediately
-    // — no recursion.
-    let roundtrip: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(
-        libc::dlsym(
-            libc::RTLD_DEFAULT,
-            c"wl_display_roundtrip".as_ptr() as *const c_char,
-        ),
-    );
-    if roundtrip as usize != 0 {
-        roundtrip(display);
-    }
-
-    let d = display as *mut wl_display_header;
-    let map = &(*d).objects;
-    let entries = map.client_entries.data as *const usize;
-    let count = map.client_entries.size / std::mem::size_of::<usize>();
-
-    if !entries.is_null() && count > 0 {
-        let slice = std::slice::from_raw_parts(entries, count);
-        for &entry_val in slice.iter() {
-            // Skip free-list entries and NULL.  On x86_64 valid
-            // heap pointers always exceed u32::MAX, whereas free-list
-            // entries are small u32 indices.
-            let entry_ptr = (entry_val & !0x3usize) as *mut c_void;
-            if entry_ptr as usize > u32::MAX as usize && !entry_ptr.is_null() {
-                try_capture(entry_ptr);
+    /// Feed a message travelling *from the app to the compositor* (requests).
+    /// Learn object types from request patterns.
+    fn feed_client_request(&mut self, msg: &WireMessage) {
+        // Seat detection via request patterns:
+        // wl_seat.get_pointer: opcode=0, args=[new_id]
+        // wl_seat.get_keyboard: opcode=1, args=[new_id]
+        // When we see opcode=0 then opcode=1 on the same object (typical for
+        // seat.get_pointer followed by seat.get_keyboard), mark it as seat
+        // and record the pointer/keyboard IDs.
+        if msg.opcode == 0 && !msg.args.is_empty() {
+            let new_id = msg.args[0];
+            if new_id != 0 {
+                self.pending_bind = Some((msg.object_id, new_id));
             }
-        }
-    }
-
-    // Walk the proxy_list of every captured proxy's event queue to
-    // pick up proxies that were removed from the wl_map (seat,
-    // pointer, keyboard are frequent casualties of the wrapper
-    // pattern in wayland-backend's send_request).
-    sweep_event_queues();
-}
-
-unsafe fn sweep_event_queues() {
-    let queue = {
-        let mut found: *mut c_void = std::ptr::null_mut();
-        for atomic in [&G_SEAT, &G_POINTER, &G_KEYBOARD, &G_XDG_TOPLEVEL] {
-            let p = atomic.load(Ordering::Acquire);
-            if !p.is_null() {
-                let proxy = p as *mut wl_proxy;
-                let q = (*proxy).queue;
-                if !q.is_null() {
-                    found = q;
-                    break;
+        } else if msg.opcode == 1 && !msg.args.is_empty() {
+            let new_id = msg.args[0];
+            if let Some((pending_obj, pending_new_id)) = self.pending_bind.take() {
+                if pending_obj == msg.object_id {
+                    // Pair: opcode=0 + opcode=1 on same object → likely seat.
+                    self.set_object(msg.object_id, ObjectKind::WlSeat);
+                    self.set_object(pending_new_id, ObjectKind::WlPointer);
+                    self.set_object(new_id, ObjectKind::WlKeyboard);
+                } else {
+                    // Opcode=1 on a different object — still could be seat.get_keyboard.
+                    // Reset pending; we'll try again next time.
+                }
+            } else {
+                // Opcode=1 without prior opcode=0 — could be seat.get_keyboard if
+                // we already know the seat from other sources.
+                if let Some(&ObjectKind::WlSeat) = self.objects.get(&msg.object_id) {
+                    self.set_object(new_id, ObjectKind::WlKeyboard);
                 }
             }
+        } else {
+            // Clear pending bind on any other opcode.
+            self.pending_bind = None;
         }
-        found
-    };
 
-    if queue.is_null() {
-        return;
-    }
-
-    let q = queue as *mut wl_event_queue;
-    let head = &(*q).proxy_list as *const wl_list as *mut wl_list;
-    let mut cur = (*head).next;
-
-    while cur != head && !cur.is_null() {
-        let link_offset = core::mem::offset_of!(wl_proxy, queue_link);
-        let proxy = (cur as usize - link_offset) as *mut c_void;
-        if proxy as usize > u32::MAX as usize && !proxy.is_null() {
-            try_capture(proxy);
+        // Known-seat detection (backup for already-identified seats).
+        if let Some(&ObjectKind::WlSeat) = self.objects.get(&msg.object_id) {
+            match msg.opcode {
+                0 if !msg.args.is_empty() => {
+                    self.set_object(msg.args[0], ObjectKind::WlPointer);
+                }
+                1 if !msg.args.is_empty() => {
+                    self.set_object(msg.args[0], ObjectKind::WlKeyboard);
+                }
+                _ => {}
+            }
         }
-        cur = (*cur).next;
-    }
-}
 
-// ---------------------------------------------------------------------------
-// Run hooks (called from every patched dispatch function)
-// ---------------------------------------------------------------------------
-
-unsafe fn run_hooks(display: *mut c_void) {
-    G_DISPATCH_CALLED.store(true, Ordering::Release);
-
-    if !G_INITIAL_SWEEP_DONE.swap(true, Ordering::SeqCst) {
-        guarded_sweep(display);
-    }
-
-    let cmds = {
-        let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *q)
-    };
-    for cmd in cmds {
-        dispatch_event(display, cmd);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Dispatch hooks — these replace the real functions via GOT patching
-// ---------------------------------------------------------------------------
-
-unsafe extern "C" fn hook_dispatch(display: *mut c_void) -> c_int {
-    run_hooks(display);
-    let real_ptr = REAL_DISPATCH.load(Ordering::SeqCst);
-    if real_ptr == 0 {
-        let real: unsafe extern "C" fn(*mut c_void) -> c_int =
-            std::mem::transmute(libc::dlsym(
-                libc::RTLD_DEFAULT,
-                c"wl_display_dispatch".as_ptr() as *const c_char,
-            ));
-        if real as usize == 0 {
-            return -1;
+        // Surface detection: objects that receive commit(opcode=6) or frame(opcode=3)
+        // requests are likely wl_surface.
+        match msg.opcode {
+            3 | 6 => {
+                if !self.objects.contains_key(&msg.object_id) {
+                    self.set_object(msg.object_id, ObjectKind::WlSurface);
+                }
+            }
+            _ => {}
         }
-        return real(display);
     }
-    let real: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(real_ptr);
-    real(display)
-}
 
-unsafe extern "C" fn hook_dispatch_pending(display: *mut c_void) -> c_int {
-    run_hooks(display);
-    let real_ptr = REAL_DISPATCH_PENDING.load(Ordering::SeqCst);
-    if real_ptr == 0 {
-        // Fall back to calling the real function via dlsym if GOT patching
-        // didn't capture the original pointer (possible in bare C executables
-        // that resolve symbols differently).
-        let real: unsafe extern "C" fn(*mut c_void) -> c_int =
-            std::mem::transmute(libc::dlsym(
-                libc::RTLD_DEFAULT,
-                c"wl_display_dispatch_pending".as_ptr() as *const c_char,
-            ));
-        if real as usize == 0 {
-            return -1;
-        }
-        return real(display);
-    }
-    let real: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(real_ptr);
-    real(display)
-}
-
-unsafe extern "C" fn hook_dispatch_queue(display: *mut c_void, queue: *mut c_void) -> c_int {
-    run_hooks(display);
-    let real_ptr = REAL_DISPATCH_QUEUE.load(Ordering::SeqCst);
-    if real_ptr == 0 {
-        return -1;
-    }
-    let real: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
-        std::mem::transmute(real_ptr);
-    real(display, queue)
-}
-
-unsafe extern "C" fn hook_dispatch_queue_pending(
-    display: *mut c_void,
-    queue: *mut c_void,
-) -> c_int {
-    run_hooks(display);
-    let real_ptr = REAL_DISPATCH_QUEUE_PENDING.load(Ordering::SeqCst);
-    if real_ptr == 0 {
-        return -1;
-    }
-    let real: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int =
-        std::mem::transmute(real_ptr);
-    real(display, queue)
-}
-
-unsafe extern "C" fn hook_add_dispatcher(
-    proxy: *mut c_void,
-    dispatcher: *mut c_void,
-    implementation: *const c_void,
-    data: *mut c_void,
-) {
-    capture_proxy(proxy);
-    let real_ptr = REAL_ADD_DISPATCHER.load(Ordering::SeqCst);
-    if real_ptr == 0 {
-        // Fall back to dlsym if GOT patching didn't capture the real
-        // pointer (e.g., lazy binding wrote a stub address).
-        let real = libc::dlsym(
-            libc::RTLD_DEFAULT,
-            c"wl_proxy_add_dispatcher".as_ptr() as *const c_char,
-        );
-        if real.is_null() {
+    /// Record an object's type.  Also updates the convenience fields.
+    fn set_object(&mut self, id: u32, kind: ObjectKind) {
+        if id == 0 {
             return;
         }
-        let real: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) =
-            std::mem::transmute(real);
-        real(proxy, dispatcher, implementation, data);
-        return;
-    }
-    let real: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, *mut c_void) =
-        std::mem::transmute(real_ptr);
-    real(proxy, dispatcher, implementation, data);
-}
-
-/// Hook installed on `wl_proxy_add_listener`.  Captures listener-style
-/// input proxies (pointer, keyboard, seat, xdg_toplevel) so we can later
-/// deliver synthetic input via `invoke_listener`.
-unsafe extern "C" fn hook_add_listener(
-    proxy: *mut c_void,
-    implementation: *const c_void,
-    data: *mut c_void,
-) -> c_int {
-    capture_proxy(proxy);
-    let real_ptr = REAL_ADD_LISTENER.load(Ordering::SeqCst);
-    if real_ptr == 0 {
-        let real = libc::dlsym(
-            libc::RTLD_DEFAULT,
-            c"wl_proxy_add_listener".as_ptr() as *const c_char,
-        );
-        if real.is_null() {
-            return -1;
+        self.objects.insert(id, kind);
+        match kind {
+            ObjectKind::WlPointer => {
+                self.pointer_id = Some(id);
+            }
+            ObjectKind::WlKeyboard => {
+                self.keyboard_id = Some(id);
+            }
+            ObjectKind::WlSurface => {
+                if self.surface_id.is_none() {
+                    self.surface_id = Some(id);
+                }
+            }
+            ObjectKind::WlSeat => {
+                self.seat_id = Some(id);
+            }
         }
-        let real: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int =
-            std::mem::transmute(real);
-        return real(proxy, implementation, data);
     }
-    let real: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) -> c_int =
-        std::mem::transmute(real_ptr);
-    real(proxy, implementation, data)
 }
 
 // ---------------------------------------------------------------------------
-// poll/ppoll hooks — eventfd wake for blocked dispatch loops
-// ---------------------------------------------------------------------------
-//
-// After the IPC thread queues a synthetic input command, a real app
-// blocked in poll(…, -1) will never wake — no Wayland event arrives,
-// so the dispatch hooks never drain the queue.  We hook poll and ppoll,
-// fold in an eventfd, and write to it from the IPC thread when a
-// command is queued.  The poll returns, the app's loop iterates, the
-// hooked dispatch_pending fires, and the queued input is delivered.
-
-/// Buffer size for the extended pollfd set.  32 fds is generous — most
-/// Wayland clients poll 1–2 fds.
-const POLL_BUF_CAP: usize = 32;
-
-unsafe extern "C" fn hook_poll(
-    fds: *mut libc::pollfd,
-    nfds: libc::nfds_t,
-    timeout: libc::c_int,
-) -> libc::c_int {
-    POLL_HOOK_COUNT.fetch_add(1, Ordering::Relaxed);
-    let in_nfds = nfds as usize;
-    let real_ptr = REAL_POLL.load(Ordering::SeqCst);
-    if real_ptr == 0 || in_nfds == 0 || in_nfds + 1 > POLL_BUF_CAP {
-        // Fall back to real poll via dlsym if the GOT patch didn't
-        // capture the real pointer, or if the fd set would overflow
-        // our stack buffer.
-        let real = libc::dlsym(libc::RTLD_DEFAULT, c"poll".as_ptr() as *const c_char);
-        let real_poll: extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
-            if real.is_null() {
-                return -1;
-            } else {
-                std::mem::transmute::<
-                    *mut c_void,
-                    extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int,
-                >(real)
-            };
-        return real_poll(fds, nfds, timeout);
-    }
-    let real_poll: extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int =
-        std::mem::transmute::<
-            usize,
-            extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int,
-        >(real_ptr);
-
-    let efd = WAKE_EVENTFD.load(Ordering::Acquire);
-    if efd < 0 {
-        return real_poll(fds, nfds, timeout);
-    }
-
-    let mut buf: [libc::pollfd; POLL_BUF_CAP] = std::mem::zeroed();
-    for (i, item) in buf.iter_mut().enumerate().take(in_nfds) {
-        *item = *fds.add(i);
-    }
-    buf[in_nfds].fd = efd;
-    buf[in_nfds].events = libc::POLLIN;
-
-    let ret = real_poll(buf.as_mut_ptr(), (in_nfds + 1) as libc::nfds_t, timeout);
-
-    // Copy revents back to caller's fds.
-    for (i, item) in buf.iter().enumerate().take(in_nfds) {
-        (*fds.add(i)).revents = item.revents;
-    }
-
-    if ret > 0 && (buf[in_nfds].revents & libc::POLLIN != 0) {
-        // Drain our eventfd and exclude it from the returned count.
-        let mut val: u64 = 0;
-        libc::read(efd, &raw mut val as *mut c_void, 8);
-        return ret - 1;
-    }
-    ret
-}
-
-unsafe extern "C" fn hook_ppoll(
-    fds: *mut libc::pollfd,
-    nfds: libc::nfds_t,
-    timeout: *const libc::timespec,
-    sigmask: *const libc::sigset_t,
-) -> libc::c_int {
-    let in_nfds = nfds as usize;
-    let real_ptr = REAL_PPOLL.load(Ordering::SeqCst);
-    if real_ptr == 0 || in_nfds == 0 || in_nfds + 1 > POLL_BUF_CAP {
-        let real = libc::dlsym(libc::RTLD_DEFAULT, c"ppoll".as_ptr() as *const c_char);
-        let real_ppoll: extern "C" fn(
-            *mut libc::pollfd,
-            libc::nfds_t,
-            *const libc::timespec,
-            *const libc::sigset_t,
-        ) -> libc::c_int = if real.is_null() {
-            return -1;
-        } else {
-            std::mem::transmute::<
-                *mut c_void,
-                extern "C" fn(
-                    *mut libc::pollfd,
-                    libc::nfds_t,
-                    *const libc::timespec,
-                    *const libc::sigset_t,
-                ) -> libc::c_int,
-            >(real)
-        };
-        return real_ppoll(fds, nfds, timeout, sigmask);
-    }
-    let real_ppoll: extern "C" fn(
-        *mut libc::pollfd,
-        libc::nfds_t,
-        *const libc::timespec,
-        *const libc::sigset_t,
-    ) -> libc::c_int = std::mem::transmute::<
-        usize,
-        extern "C" fn(
-            *mut libc::pollfd,
-            libc::nfds_t,
-            *const libc::timespec,
-            *const libc::sigset_t,
-        ) -> libc::c_int,
-    >(real_ptr);
-
-    let efd = WAKE_EVENTFD.load(Ordering::Acquire);
-    if efd < 0 {
-        return real_ppoll(fds, nfds, timeout, sigmask);
-    }
-
-    let mut buf: [libc::pollfd; POLL_BUF_CAP] = std::mem::zeroed();
-    for (i, item) in buf.iter_mut().enumerate().take(in_nfds) {
-        *item = *fds.add(i);
-    }
-    buf[in_nfds].fd = efd;
-    buf[in_nfds].events = libc::POLLIN;
-
-    let ret = real_ppoll(
-        buf.as_mut_ptr(),
-        (in_nfds + 1) as libc::nfds_t,
-        timeout,
-        sigmask,
-    );
-
-    for (i, item) in buf.iter().enumerate().take(in_nfds) {
-        (*fds.add(i)).revents = item.revents;
-    }
-
-    if ret > 0 && (buf[in_nfds].revents & libc::POLLIN != 0) {
-        let mut val: u64 = 0;
-        libc::read(efd, &raw mut val as *mut c_void, 8);
-        return ret - 1;
-    }
-    ret
-}
-
-// ---------------------------------------------------------------------------
-// GOT patching
+// Fd discovery — find the Wayland socket in /proc/self/fd
 // ---------------------------------------------------------------------------
 
-/// Patch the GOT entry for `symbol` in every loaded module to point to `hook`.
-unsafe fn patch_all_gots(symbol: &str, hook: *mut c_void) {
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(m) => m,
-        Err(_) => return,
+/// Try to find the Wayland display fd by scanning `/proc/self/fd`.
+/// Matches AF_UNIX SOCK_STREAM sockets whose peer is `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`.
+fn find_wayland_fd() -> Option<c_int> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let wayland_display = std::env::var_os("WAYLAND_DISPLAY")
+        .unwrap_or_else(|| std::ffi::OsString::from("wayland-0"));
+    let expected_path = runtime_dir.join(&wayland_display);
+
+    // Read /proc/self/fd to enumerate fds.
+    let fd_dir = match std::fs::read_dir("/proc/self/fd") {
+        Ok(d) => d,
+        Err(_) => return None,
     };
 
-    let mut seen = std::collections::HashSet::new();
+    for entry in fd_dir.flatten() {
+        let path = entry.path();
+        // The link target is something like "socket:[12345]".
+        // We skip the link check — instead we probe the socket directly.
 
-    for line in maps.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            continue;
-        }
-        let path = parts[5];
-        if !path.starts_with('/') {
-            continue;
-        }
+        let fd_str = path.file_name()?.to_str()?.to_string();
+        let fd: c_int = fd_str.parse().ok()?;
 
-        let addr_range: Vec<&str> = parts[0].split('-').collect();
-        if addr_range.len() != 2 {
-            continue;
-        }
-        let base = match usize::from_str_radix(addr_range[0], 16) {
-            Ok(b) => b,
-            Err(_) => continue,
+        // Use getsockopt to check socket type and domain.
+        let mut sock_type: libc::c_int = 0;
+        let mut type_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as u32;
+        let type_ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                &mut sock_type as *mut _ as *mut c_void,
+                &mut type_len,
+            )
         };
-
-        if !seen.insert(path.to_string()) {
+        if type_ret != 0 || sock_type != libc::SOCK_STREAM {
             continue;
         }
 
-        patch_got_in_module(base, path, symbol, hook);
+        let mut domain: libc::c_int = 0;
+        let mut domain_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as u32;
+        let domain_ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_DOMAIN,
+                &mut domain as *mut _ as *mut c_void,
+                &mut domain_len,
+            )
+        };
+        if domain_ret != 0 || domain != libc::AF_UNIX {
+            continue;
+        }
+
+        // For a definitive match, try SO_PEERNAME and compare with the
+        // expected compositor socket path.
+        if is_socket_peer(fd, &expected_path) {
+            return Some(fd);
+        }
+
+        // If SO_PEERNAME fails, fall back: if the target has exactly
+        // one AF_UNIX SOCK_STREAM socket, use it.
     }
-}
 
-/// Read `/proc/self/maps` to determine the original protection of the page
-/// containing `addr`.
-unsafe fn page_protection(addr: usize) -> Option<i32> {
-    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
-    for line in maps.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let range: Vec<&str> = parts[0].split('-').collect();
-        if range.len() != 2 {
-            continue;
-        }
-        let start = usize::from_str_radix(range[0], 16).ok()?;
-        let end = usize::from_str_radix(range[1], 16).ok()?;
-        if addr >= start && addr < end {
-            let perms = parts[1].as_bytes();
-            let mut prot = 0;
-            if perms.first() == Some(&b'r') {
-                prot |= libc::PROT_READ;
+    // Fallback: if we found any AF_UNIX SOCK_STREAM socket, return it.
+    // Walk again and collect candidates.
+    let candidates: Vec<c_int> = std::fs::read_dir("/proc/self/fd")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let fd_str = path.file_name()?.to_str()?.to_string();
+            let fd: c_int = fd_str.parse().ok()?;
+            let mut sock_type: libc::c_int = 0;
+            let mut type_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as u32;
+            let type_ret = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    &mut sock_type as *mut _ as *mut c_void,
+                    &mut type_len,
+                )
+            };
+            if type_ret != 0 || sock_type != libc::SOCK_STREAM {
+                return None;
             }
-            if perms.get(1) == Some(&b'w') {
-                prot |= libc::PROT_WRITE;
+            let mut domain: libc::c_int = 0;
+            let mut domain_len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as u32;
+            let domain_ret = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_DOMAIN,
+                    &mut domain as *mut _ as *mut c_void,
+                    &mut domain_len,
+                )
+            };
+            if domain_ret != 0 || domain != libc::AF_UNIX {
+                return None;
             }
-            if perms.get(2) == Some(&b'x') {
-                prot |= libc::PROT_EXEC;
-            }
-            return Some(prot);
-        }
+            Some(fd)
+        })
+        .collect();
+
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
     }
+
     None
 }
 
-unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut c_void) {
-    // Never patch libwayland-client itself — it *defines* these symbols.
-    if path.contains("libwayland-client") {
-        return;
-    }
-    // Never patch our own payload — would create infinite recursion
-    // when we hook poll/ppoll (which we call internally).
-    if path.contains("backseat_payload") {
-        return;
-    }
-    // Never patch libc itself — it defines poll/ppoll.
-    if (symbol == "poll" || symbol == "ppoll") && path.contains("libc") {
-        return;
-    }
+/// Check whether `fd` is connected to the socket at `expected_path`.
+fn is_socket_peer(fd: c_int, expected_path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
 
-    // Primary path: parse .rela.plt / .rela.dyn via goblin from the
-    // on-disk file.  This works for most modules including the Rust
-    // test fixture.
-    //
-    // FIXME: goblin returns empty pltrelocs for some PIE executables
-    // (the C test fixture).  The PT_DYNAMIC walk in
-    // patch_got_from_memory is the intended fix but currently causes
-    // a SIGSEGV during dlopen — needs debugging.
-    patch_got_via_goblin(base, path, symbol, hook);
-}
+    let expected_bytes = expected_path.as_os_str().as_bytes();
+    // Allocate enough space for the sockaddr_un (sun_path is up to 108 bytes).
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_un>() as u32;
 
-/// Primary patching path using goblin.  Returns true if at least one
-/// GOT entry was found and patched.
-unsafe fn patch_got_via_goblin(
-    base: usize,
-    path: &str,
-    symbol: &str,
-    hook: *mut c_void,
-) -> bool {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return false,
+    let ret = unsafe {
+        libc::getpeername(
+            fd,
+            &mut addr as *mut _ as *mut libc::sockaddr,
+            &mut addr_len,
+        )
     };
-
-    let elf = match goblin::Object::parse(&data) {
-        Ok(goblin::Object::Elf(e)) => e,
-        _ => return false,
-    };
-
-    let load_bias = elf
-        .program_headers
-        .iter()
-        .find(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
-        .map_or(base, |ph| base.wrapping_sub(ph.p_vaddr as usize));
-
-    let relocs: Vec<_> = elf.pltrelocs.iter().chain(elf.dynrelas.iter()).collect();
-    if relocs.is_empty() {
-        return false;
-    }
-
-    let mut found = false;
-    for rela in &relocs {
-        let sym = match elf.dynsyms.get(rela.r_sym) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let sym_name = elf.dynstrtab.get_at(sym.st_name);
-        if sym_name != Some(symbol) {
-            continue;
-        }
-
-        if sym.st_shndx as u32 != goblin::elf::section_header::SHN_UNDEF || sym.st_value != 0 {
-            continue;
-        }
-
-        let got_entry = (load_bias + rela.r_offset as usize) as *mut *mut c_void;
-
-        let c_sym = std::ffi::CString::new(symbol).unwrap();
-        let resolved = libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr());
-        let real = if resolved.is_null() {
-            *got_entry
-        } else {
-            resolved
-        };
-        store_real(symbol, real);
-
-        let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-        let page_start = (got_entry as usize) & !(page_size - 1);
-        let old_prot = page_protection(page_start);
-        if old_prot.is_none() {
-            continue;
-        }
-
-        let ret = libc::mprotect(
-            page_start as *mut c_void,
-            page_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-        );
-        if ret != 0 {
-            continue;
-        }
-
-        *got_entry = hook;
-
-        if let Some(prot) = old_prot {
-            let _ = libc::mprotect(page_start as *mut c_void, page_size, prot);
-        }
-        found = true;
-        break;
-    }
-    found
-}
-
-/// Walk the loaded ELF image at `base` to find and patch GOT entries
-/// for `symbol`.  Reads ELF structures directly from mapped memory.
-/// FIXME: disabled (unused) — triggers SIGSEGV during dlopen.
-#[allow(dead_code)]
-unsafe fn patch_got_from_memory(base: usize, symbol: &str, hook: *mut c_void) {
-    const PT_DYNAMIC: u32 = 2;
-    const PT_LOAD: u32 = 1;
-    const DT_NULL: i64 = 0;
-    const DT_STRTAB: i64 = 5;
-    const DT_SYMTAB: i64 = 6;
-    const DT_RELA: i64 = 7;
-    const DT_RELASZ: i64 = 8;
-    const DT_JMPREL: i64 = 23;
-    const DT_PLTRELSZ: i64 = 2;
-    const SHN_UNDEF: u16 = 0;
-    const STT_FUNC: u8 = 2;
-
-    // Check that the base page is readable before dereferencing.
-    if page_protection(base).is_none() {
-        return;
-    }
-
-    let ehdr = base as *const Elf64Ehdr;
-    // Verify 4-byte ELF magic.
-    if (*ehdr).e_ident.get(0..4) != Some(&[0x7f, b'E', b'L', b'F']) {
-        return;
-    }
-
-    // Find the first PT_LOAD to compute load_bias.
-    let phoff = (*ehdr).e_phoff as usize;
-    let phnum = (*ehdr).e_phnum as usize;
-    let phentsize = (*ehdr).e_phentsize as usize;
-
-    // Sanity-check program header counts to avoid walking garbage.
-    if phnum == 0 || phnum > 128 || phentsize < core::mem::size_of::<Elf64Phdr>() {
-        return;
-    }
-
-    let mut load_bias: isize = 0;
-    let mut dyn_vaddr: usize = 0;
-    let mut dyn_sz: usize = 0;
-
-    for i in 0..phnum {
-        let phdr = (base + phoff + i * phentsize) as *const Elf64Phdr;
-        match (*phdr).p_type {
-            PT_LOAD if load_bias == 0 => {
-                load_bias = base as isize - (*phdr).p_vaddr as isize;
-            }
-            PT_DYNAMIC => {
-                dyn_vaddr = (*phdr).p_vaddr as usize;
-                dyn_sz = (*phdr).p_memsz as usize;
-            }
-            _ => {}
-        }
-    }
-
-    if dyn_vaddr == 0 || dyn_sz == 0 || dyn_sz > 0x10000 {
-        return;
-    }
-
-    let dyn_start = (load_bias as usize + dyn_vaddr) as *const Elf64Dyn;
-    let dyn_count = dyn_sz / core::mem::size_of::<Elf64Dyn>();
-
-    let mut strtab: *const u8 = std::ptr::null();
-    let mut symtab: *const Elf64Sym = std::ptr::null();
-    let mut jmprel: *const Elf64Rela = std::ptr::null();
-    let mut jmprel_sz: usize = 0;
-    let mut rela: *const Elf64Rela = std::ptr::null();
-    let mut rela_sz: usize = 0;
-
-    for i in 0..dyn_count {
-        let d = dyn_start.add(i);
-        match (*d).d_tag {
-            DT_NULL => break,
-            DT_STRTAB => strtab = (load_bias as usize + (*d).d_val as usize) as *const u8,
-            DT_SYMTAB => symtab = (load_bias as usize + (*d).d_val as usize) as *const Elf64Sym,
-            DT_JMPREL => jmprel = (load_bias as usize + (*d).d_val as usize) as *const Elf64Rela,
-            DT_PLTRELSZ => jmprel_sz = (*d).d_val as usize,
-            DT_RELA => rela = (load_bias as usize + (*d).d_val as usize) as *const Elf64Rela,
-            DT_RELASZ => rela_sz = (*d).d_val as usize,
-            _ => {}
-        }
-    }
-
-    if strtab.is_null() || symtab.is_null() {
-        return;
-    }
-
-    // Cap relocation table sizes to avoid walking garbage.
-    let rela_entry_sz = core::mem::size_of::<Elf64Rela>();
-    if jmprel_sz > 0x10000 {
-        jmprel_sz = 0;
-    }
-    if rela_sz > 0x10000 {
-        rela_sz = 0;
-    }
-
-    let c_sym = std::ffi::CString::new(symbol).unwrap();
-    let target_bytes = symbol.as_bytes();
-
-    // Process .rela.plt (DT_JMPREL) first, then .rela.dyn (DT_RELA).
-    if !jmprel.is_null() && jmprel_sz > 0 {
-        let count = jmprel_sz / rela_entry_sz;
-        for i in 0..count {
-            let r = jmprel.add(i);
-            let sym_idx = ((*r).r_info >> 32) as u32;
-            let sym = symtab.add(sym_idx as usize);
-
-            let st_type = (*sym).st_info & 0xf;
-            if st_type != STT_FUNC {
-                continue;
-            }
-            if (*sym).st_shndx != SHN_UNDEF {
-                continue;
-            }
-
-            let name_ptr = strtab.add((*sym).st_name as usize);
-            let name = std::ffi::CStr::from_ptr(name_ptr as *const i8);
-            if name.to_bytes() != target_bytes {
-                continue;
-            }
-
-            apply_got_patch(load_bias, *r, symbol, &c_sym, hook);
-            return;
-        }
-    }
-    if !rela.is_null() && rela_sz > 0 {
-        let count = rela_sz / rela_entry_sz;
-        for i in 0..count {
-            let r = rela.add(i);
-            let sym_idx = ((*r).r_info >> 32) as u32;
-            let sym = symtab.add(sym_idx as usize);
-
-            let st_type = (*sym).st_info & 0xf;
-            if st_type != STT_FUNC {
-                continue;
-            }
-            if (*sym).st_shndx != SHN_UNDEF {
-                continue;
-            }
-
-            let name_ptr = strtab.add((*sym).st_name as usize);
-            let name = std::ffi::CStr::from_ptr(name_ptr as *const i8);
-            if name.to_bytes() != target_bytes {
-                continue;
-            }
-
-            apply_got_patch(load_bias, *r, symbol, &c_sym, hook);
-            return;
-        }
-    }
-}
-
-#[allow(dead_code)]
-unsafe fn apply_got_patch(
-    load_bias: isize,
-    r: Elf64Rela,
-    symbol: &str,
-    c_sym: &std::ffi::CString,
-    hook: *mut c_void,
-) {
-    let got_entry = (load_bias as usize + r.r_offset as usize) as *mut *mut c_void;
-
-    let resolved = libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr());
-    let real = if resolved.is_null() {
-        *got_entry
-    } else {
-        resolved
-    };
-    store_real(symbol, real);
-
-    let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-    let page_start = (got_entry as usize) & !(page_size - 1);
-    let old_prot = page_protection(page_start);
-    if old_prot.is_none() {
-        return;
-    }
-
-    let ret = libc::mprotect(
-        page_start as *mut c_void,
-        page_size,
-        libc::PROT_READ | libc::PROT_WRITE,
-    );
     if ret != 0 {
-        return;
-    }
-
-    *got_entry = hook;
-
-    if let Some(prot) = old_prot {
-        let _ = libc::mprotect(page_start as *mut c_void, page_size, prot);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ELF64 structures for direct memory reading
-// ---------------------------------------------------------------------------
-
-#[repr(C)]
-#[allow(dead_code)]
-struct Elf64Ehdr {
-    e_ident: [u8; 16],
-    e_type: u16,
-    e_machine: u16,
-    e_version: u32,
-    e_entry: u64,
-    e_phoff: u64,
-    e_shoff: u64,
-    e_flags: u32,
-    e_ehsize: u16,
-    e_phentsize: u16,
-    e_phnum: u16,
-    e_shentsize: u16,
-    e_shnum: u16,
-    e_shstrndx: u16,
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-struct Elf64Phdr {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-struct Elf64Dyn {
-    d_tag: i64,
-    d_val: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-struct Elf64Rela {
-    r_offset: u64,
-    r_info: u64,
-    r_addend: i64,
-}
-
-#[repr(C)]
-#[allow(dead_code)]
-struct Elf64Sym {
-    st_name: u32,
-    st_info: u8,
-    st_other: u8,
-    st_shndx: u16,
-    st_value: u64,
-    st_size: u64,
-}
-
-// End of ELF64 structures
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Synthetic input dispatch — calls the proxy's dispatcher directly.
-// ---------------------------------------------------------------------------
-
-/// Called from C (shim.c) via dl_iterate_phdr for each loaded module.
-/// FIXME: the PT_DYNAMIC + DT_JMPREL walk body triggers SIGSEGV during
-/// dlopen on some module.  The no-op return proves the callback mechanism
-/// is correct; filling in the body is the next step.
-#[no_mangle]
-unsafe extern "C" fn rust_patch_got_for_module(
-    _base: usize,
-    _phdr: *const Elf64Phdr,
-    _phnum: u16,
-    _symbol: *const std::ffi::c_char,
-    _hook: *mut c_void,
-) -> std::ffi::c_int {
-    0
-}
-
-/// Matches libwayland's `union wl_argument`.
-#[repr(C)]
-union wl_argument {
-    i: i32,
-    u: u32,
-    f: i32, // wl_fixed_t
-    s: *const c_char,
-    o: *mut c_void,
-    n: u32,
-    a: *mut c_void,
-    h: i32,
-}
-
-/// Signature of the dispatcher installed by wayland-backend.
-type DispatcherFn = unsafe extern "C" fn(
-    *const c_void,
-    *mut c_void,
-    u32,
-    *const c_void,
-    *const wl_argument,
-) -> c_int;
-
-unsafe fn invoke_dispatcher(proxy: *mut c_void, opcode: u32, args: &mut [wl_argument]) -> bool {
-    let p = proxy as *mut wl_proxy;
-    let dispatcher_ptr = (*p).dispatcher;
-    if dispatcher_ptr.is_null() {
         return false;
     }
-    let disp: DispatcherFn = std::mem::transmute(dispatcher_ptr);
-    let impl_ptr = (*p).object.implementation;
-    let _ = disp(impl_ptr, proxy, opcode, std::ptr::null(), args.as_ptr());
+
+    // addr.sun_family should be AF_UNIX.
+    if addr.sun_family as libc::c_int != libc::AF_UNIX {
+        return false;
+    }
+
+    // sun_path is a c_char array (108 bytes).  Compare with expected path.
+    let path_len = expected_bytes.len().min(addr.sun_path.len());
+    let actual_path = &addr.sun_path[..path_len];
+    // sun_path may be null-padded.  Find the actual length.
+    let actual_len = actual_path
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(path_len);
+    let actual = &actual_path[..actual_len];
+
+    // Compare bytes (C strings, not necessarily valid UTF-8).
+    if actual.len() != expected_bytes.len() {
+        return false;
+    }
+    // Abstract sockets start with '\0'.  Skip those — Wayland uses
+    // pathname sockets.
+    if actual.first() == Some(&0) {
+        return false;
+    }
+    actual.iter().zip(expected_bytes.iter()).all(|(a, b)| *a as u8 == *b)
+}
+
+// ---------------------------------------------------------------------------
+// Fd hijack — insert socketpair between the app and compositor
+// ---------------------------------------------------------------------------
+
+/// Result of hijacking the Wayland fd.
+struct HijackResult {
+    /// The real compositor fd (stashed, still connected).
+    stash_fd: c_int,
+    /// Our end of the socketpair (the app talks to us here).
+    ours_fd: c_int,
+}
+
+/// Replace the app's Wayland fd with our socketpair.
+///
+/// 1. `dup(wl_fd)` → stash_fd (preserves compositor connection).
+/// 2. `socketpair(AF_UNIX, SOCK_STREAM)` → (ours_fd, theirs_fd).
+/// 3. `dup2(theirs_fd, wl_fd)` → app now talks to us on the same fd number.
+/// 4. `close(theirs_fd)` — app keeps the duped fd.
+///
+/// The app stays blocked in `poll()` on wl_fd and doesn't notice the swap.
+/// After this, all app↔compositor traffic flows through `stash_fd` ↔ `ours_fd`.
+fn hijack_fd(wl_fd: c_int) -> Option<HijackResult> {
+    unsafe {
+        let stash_fd = libc::dup(wl_fd);
+        if stash_fd < 0 {
+            return None;
+        }
+
+        let mut fds = [-1i32; 2];
+        if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) != 0 {
+            libc::close(stash_fd);
+            return None;
+        }
+        let ours_fd = fds[0];
+        let theirs_fd = fds[1];
+
+        if libc::dup2(theirs_fd, wl_fd) < 0 {
+            libc::close(stash_fd);
+            libc::close(ours_fd);
+            libc::close(theirs_fd);
+            return None;
+        }
+        libc::close(theirs_fd);
+
+        Some(HijackResult { stash_fd, ours_fd })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pump thread — faithful bidirectional forwarding with SCM_RIGHTS
+// ---------------------------------------------------------------------------
+
+/// Maximum number of file descriptors we forward per message.
+const MAX_CMSG_FDS: usize = 28;
+
+/// Size of the cmsg buffer for `recvmsg`/`sendmsg`.
+const CMSG_BUF_SIZE: usize = unsafe {
+    libc::CMSG_SPACE((std::mem::size_of::<c_int>() * MAX_CMSG_FDS) as u32) as usize
+};
+
+/// Write a complete byte buffer to an fd, looping on short writes.
+/// MUST hold `APP_WRITE_LOCK` when writing to `app_fd`.
+fn write_all(fd: c_int, buf: &[u8]) -> bool {
+    let mut off = 0usize;
+    while off < buf.len() {
+        let n = unsafe {
+            libc::write(fd, buf.as_ptr().add(off) as *const c_void, buf.len() - off)
+        };
+        if n <= 0 {
+            let e = unsafe { *libc::__errno_location() };
+            if e == libc::EAGAIN || e == libc::EINTR {
+                continue;
+            }
+            return false;
+        }
+        off += n as usize;
+    }
     true
 }
 
-/// Deliver a synthetic event to a listener-style proxy by directly
-/// calling the listener callback in the proxy's vtable.
-///
-/// The vtable is indexed by opcode, matching event declaration order
-/// in the Wayland protocol XML.  `user_data` comes from
-/// `(*proxy).user_data`, *not* from the vtable (which is a function-
-/// pointer table, not a struct with user-data at index 1).
-///
-/// Returns `false` if the proxy has a dispatcher (not our path) or if
-/// the vtable slot for `opcode` is NULL.
-///
-/// # Safety
-/// - `proxy` must point to a valid `wl_proxy`.
-/// - The vtable at `(*proxy).object.implementation` must contain valid
-///   function pointers.
-/// - The typed call signatures below must match the Wayland protocol
-///   ABI for each event.  Getting these wrong will segfault inside the
-///   target process.
-unsafe fn invoke_listener(proxy: *mut c_void, opcode: u32, args: &[wl_argument]) -> bool {
-    let p = proxy as *mut wl_proxy;
+/// Shared state between the pump thread and the IPC injection path.
+struct PumpState {
+    /// The sniffer, protected by a mutex for access from both pump and IPC.
+    sniffer: Mutex<Sniffer>,
+    /// Whether keyboard focus (enter) has been sent to the app.
+    keyboard_focus_sent: AtomicBool,
+    /// Whether pointer focus (enter) has been sent to the app.
+    pointer_focus_sent: AtomicBool,
+    /// Next serial to use for synthetic input (seeded from server serial).
+    next_serial: AtomicU32,
+    /// Monotonic time at pump start (used as base for synthetic timestamps).
+    time_base_ms: AtomicU32,
+    /// Pump thread running flag.
+    pump_running: AtomicBool,
+    /// App-side fd (ours_fd) — used by both pump and injection, write-serialized.
+    app_fd: AtomicI32,
+    /// Surface width from configure events (if learned).
+    surface_w: AtomicU32,
+    /// Surface height from configure events (if learned).
+    surface_h: AtomicU32,
+    /// Whether wayland fd was found and hijack succeeded.
+    hijack_ok: AtomicBool,
+}
 
-    if !(*p).dispatcher.is_null() {
-        return false;
-    }
-
-    let vtable = (*p).object.implementation as *const usize;
-    if vtable.is_null() {
-        return false;
-    }
-
-    let func = *vtable.add(opcode as usize);
-    if func == 0 {
-        return false;
-    }
-
-    let data = (*p).user_data;
-
-    // Determine proxy type to resolve opcode collisions:
-    // - opcode 3: wl_pointer.button vs wl_keyboard.key
-    // - opcode 4: wl_pointer.axis vs wl_keyboard.modifiers
-    // Both are 4×u32, so opcode 3 is safe; opcode 4 differs in arity
-    // (axis = 3 args, modifiers = 5 args) so we branch on interface.
-    let iface = proxy_interface_name(proxy);
-
-    match opcode {
-        2 /* motion */ if args.len() >= 3 => {
-            let f: extern "C" fn(*mut c_void, *mut c_void, u32, i32, i32) =
-                std::mem::transmute(func);
-            f(data, proxy, args[0].u, args[1].f, args[2].f);
-            true
+impl PumpState {
+    fn new() -> Self {
+        Self {
+            sniffer: Mutex::new(Sniffer::new()),
+            keyboard_focus_sent: AtomicBool::new(false),
+            pointer_focus_sent: AtomicBool::new(false),
+            next_serial: AtomicU32::new(1),
+            time_base_ms: AtomicU32::new(0),
+            pump_running: AtomicBool::new(false),
+            app_fd: AtomicI32::new(-1),
+            surface_w: AtomicU32::new(0),
+            surface_h: AtomicU32::new(0),
+            hijack_ok: AtomicBool::new(false),
         }
-        3 /* button (pointer) or key (keyboard) */ if args.len() >= 4 => {
-            // Both wl_pointer.button and wl_keyboard.key share the same
-            // signature: fn(data, proxy, u32 serial, u32 time, u32 button/key, u32 state).
-            let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32) =
-                std::mem::transmute(func);
-            f(data, proxy, args[0].u, args[1].u, args[2].u, args[3].u);
-            true
-        }
-        4 /* axis (pointer, 3 args) or modifiers (keyboard, 5 args) */ => {
-            if iface == Some(b"wl_keyboard") {
-                // keyboard.modifiers: serial, depressed, latched, locked, group
-                let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, u32, u32, u32) =
-                    std::mem::transmute(func);
-                f(data, proxy, args[0].u, args[1].u, args[2].u, args[3].u, args[4].u);
-            } else {
-                // pointer.axis: time, axis, value (and optionally axis_discrete)
-                // We only ever send the 3-arg form (opcode 4 with time/axis/value).
-                if args.len() >= 3 {
-                    let f: extern "C" fn(*mut c_void, *mut c_void, u32, u32, i32) =
-                        std::mem::transmute(func);
-                    f(data, proxy, args[0].u, args[1].u, args[2].f);
-                }
+    }
+}
+
+static PUMP_STATE: OnceLock<PumpState> = OnceLock::new();
+
+fn pump_state() -> &'static PumpState {
+    PUMP_STATE.get_or_init(PumpState::new)
+}
+
+/// App-write lock — ensures pump and injection don't interleave writes
+/// to the app fd, which would corrupt the byte stream.
+static APP_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Main pump loop.  Runs in a dedicated thread.
+///
+/// Forwards all data between `stash_fd` (real compositor) and `ours_fd` (app),
+/// using `recvmsg`/`sendmsg` to preserve ancillary `SCM_RIGHTS` fd data.
+/// Also sniffs traffic in both directions to learn object IDs and serials.
+fn pump_loop(stash_fd: c_int, ours_fd: c_int) {
+    let state = pump_state();
+    state.pump_running.store(true, Ordering::Release);
+
+    set_nonblocking(stash_fd);
+    set_nonblocking(ours_fd);
+
+    let mut data_buf = vec![0u8; 0x10000];
+    let mut cmsg_buf = vec![0u8; CMSG_BUF_SIZE];
+
+    let base_ms = monotonic_ms();
+    state.time_base_ms.store(base_ms, Ordering::Release);
+
+    let init_serial = state.sniffer.lock().unwrap().last_server_serial + 1;
+    state.next_serial.store(init_serial, Ordering::Release);
+
+    loop {
+        let mut pollfds = [
+            libc::pollfd {
+                fd: stash_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: ours_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let ret = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 100) };
+        if ret < 0 {
+            let e = unsafe { *libc::__errno_location() };
+            if e == libc::EINTR {
+                continue;
             }
-            true
+            break;
         }
-        5 /* frame */ => {
-            let f: extern "C" fn(*mut c_void, *mut c_void) =
-                std::mem::transmute(func);
-            f(data, proxy);
-            true
+
+        // compositor → app
+        if pollfds[0].revents & libc::POLLIN != 0 {
+            let n = recv_msg(stash_fd, &mut data_buf, &mut cmsg_buf);
+            if n > 0 {
+                sniff_data(&data_buf[..n as usize], Direction::ServerToClient);
+                let _lock = APP_WRITE_LOCK.lock().unwrap();
+                send_msg(ours_fd, &data_buf[..n as usize], &cmsg_buf);
+            } else if n == 0 {
+                break;
+            }
         }
-        _ => false,
+
+        // app → compositor
+        if pollfds[1].revents & libc::POLLIN != 0 {
+            let n = recv_msg(ours_fd, &mut data_buf, &mut cmsg_buf);
+            if n > 0 {
+                sniff_data(&data_buf[..n as usize], Direction::ClientToServer);
+                send_msg(stash_fd, &data_buf[..n as usize], &cmsg_buf);
+            } else if n == 0 {
+                break;
+            }
+        }
+    }
+
+    state.pump_running.store(false, Ordering::Release);
+}
+
+fn set_nonblocking(fd: c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
 }
 
-/// Try to deliver a synthetic event to a proxy.  Returns `true` if
-/// delivery succeeded (either via dispatcher or listener path),
-/// `false` if the proxy was not reachable by either style.
-#[inline]
-unsafe fn dispatch_to_proxy(proxy: *mut c_void, opcode: u32, args: &mut [wl_argument]) -> bool {
-    invoke_dispatcher(proxy, opcode, args) || invoke_listener(proxy, opcode, args)
+/// Receive a message with ancillary fd data from `fd`.
+/// Returns number of bytes read, or 0 on EOF, or -1 on error (non-fatal).
+fn recv_msg(fd: c_int, data_buf: &mut [u8], cmsg_buf: &mut [u8]) -> isize {
+    let mut iov = libc::iovec {
+        iov_base: data_buf.as_mut_ptr() as *mut c_void,
+        iov_len: data_buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut c_void;
+    msg.msg_controllen = cmsg_buf.len();
+
+    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    if n < 0 {
+        let e = unsafe { *libc::__errno_location() };
+        if e == libc::EAGAIN || e == libc::EINTR {
+            return -1;
+        }
+        return -1;
+    }
+
+    n as isize
 }
 
-static SERIAL: AtomicU32 = AtomicU32::new(1);
+/// Send a message with ancillary fd data to `fd`.
+fn send_msg(fd: c_int, data: &[u8], cmsg_buf: &[u8]) -> bool {
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut c_void,
+        iov_len: data.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
 
-fn next_serial() -> u32 {
-    SERIAL.fetch_add(1, Ordering::SeqCst)
+    // Only attach cmsg if there's actual control data.
+    let mut cmsg_buf_local: [u8; CMSG_BUF_SIZE] = [0u8; CMSG_BUF_SIZE];
+    if !cmsg_buf.is_empty() {
+        let copy_len = cmsg_buf.len().min(CMSG_BUF_SIZE);
+        cmsg_buf_local[..copy_len].copy_from_slice(&cmsg_buf[..copy_len]);
+        msg.msg_control = cmsg_buf_local.as_mut_ptr() as *mut c_void;
+        msg.msg_controllen = copy_len;
+    }
+
+    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+    if n < 0 {
+        let e = unsafe { *libc::__errno_location() };
+        if e == libc::EAGAIN || e == libc::EINTR {
+            return true; // Non-fatal, will retry.
+        }
+        return false;
+    }
+    n as usize == data.len()
+}
+
+/// Which direction the sniffed data is travelling.
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    ServerToClient,
+    ClientToServer,
+}
+
+/// Parse all complete messages in `data` and feed them to the sniffer.
+fn sniff_data(data: &[u8], direction: Direction) {
+    let state = pump_state();
+    let mut sniffer = state.sniffer.lock().unwrap();
+    let mut offset = 0usize;
+    while offset < data.len() {
+        if let Some((msg, consumed)) = parse_message(&data[offset..]) {
+            match direction {
+                Direction::ServerToClient => sniffer.feed_server_event(&msg),
+                Direction::ClientToServer => sniffer.feed_client_request(&msg),
+            }
+            offset += consumed;
+        } else {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire injection — encode and write synthetic events to the app fd
+// ---------------------------------------------------------------------------
+
+/// Inject a keyboard event into the app's read side.
+/// Sends `wl_keyboard.enter` first if focus hasn't been established.
+fn inject_key(keycode: u32, pressed: bool) -> Result<(), String> {
+    let state = pump_state();
+
+    let kbd_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .keyboard_id
+        .ok_or_else(|| "keyboard object not discovered".to_string())?;
+
+    let surface_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .surface_id
+        .ok_or_else(|| "surface object not discovered".to_string())?;
+
+    let time = monotonic_ms() - state.time_base_ms.load(Ordering::Relaxed);
+
+    let _lock = APP_WRITE_LOCK.lock().unwrap();
+
+    // Send enter before first key if not yet focused.
+    if !state.keyboard_focus_sent.swap(true, Ordering::SeqCst) {
+        let serial = next_inject_serial();
+        let enter = encode_keyboard_enter(kbd_id, serial, surface_id, &[]);
+        if !write_all(state.app_fd.load(Ordering::Relaxed), &enter) {
+            return Err("write keyboard.enter failed".to_string());
+        }
+    }
+
+    let serial = next_inject_serial();
+    let state_code: u32 = if pressed { 1 } else { 0 };
+    let key_msg = encode_keyboard_key(kbd_id, serial, time, keycode, state_code);
+    if !write_all(state.app_fd.load(Ordering::Relaxed), &key_msg) {
+        return Err("write keyboard.key failed".to_string());
+    }
+
+    Ok(())
+}
+
+/// Inject a keyboard modifiers change.
+fn inject_modifiers(depressed: u32) -> Result<(), String> {
+    let state = pump_state();
+
+    let kbd_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .keyboard_id
+        .ok_or_else(|| "keyboard object not discovered".to_string())?;
+
+    let serial = next_inject_serial();
+    let msg = encode_keyboard_modifiers(kbd_id, serial, depressed, 0, 0, 0);
+
+    let _lock = APP_WRITE_LOCK.lock().unwrap();
+    if !write_all(state.app_fd.load(Ordering::Relaxed), &msg) {
+        return Err("write keyboard.modifiers failed".to_string());
+    }
+
+    Ok(())
+}
+
+/// Inject a pointer motion event.
+fn inject_pointer_move(x: f64, y: f64) -> Result<(), String> {
+    let state = pump_state();
+
+    let ptr_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .pointer_id
+        .ok_or_else(|| "pointer object not discovered".to_string())?;
+
+    let surface_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .surface_id
+        .ok_or_else(|| "surface object not discovered".to_string())?;
+
+    let time = monotonic_ms() - state.time_base_ms.load(Ordering::Relaxed);
+
+    let _lock = APP_WRITE_LOCK.lock().unwrap();
+
+    // Send enter before first motion if not yet focused.
+    if !state.pointer_focus_sent.swap(true, Ordering::SeqCst) {
+        let serial = next_inject_serial();
+        let enter = encode_pointer_enter(ptr_id, serial, surface_id, x, y);
+        if !write_all(state.app_fd.load(Ordering::Relaxed), &enter) {
+            return Err("write pointer.enter failed".to_string());
+        }
+    }
+
+    let motion = encode_pointer_motion(ptr_id, time, x, y);
+    if !write_all(state.app_fd.load(Ordering::Relaxed), &motion) {
+        return Err("write pointer.motion failed".to_string());
+    }
+
+    Ok(())
+}
+
+/// Inject a pointer button event.
+fn inject_pointer_button(button: u32, pressed: bool) -> Result<(), String> {
+    let state = pump_state();
+
+    let ptr_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .pointer_id
+        .ok_or_else(|| "pointer object not discovered".to_string())?;
+
+    let surface_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .surface_id
+        .ok_or_else(|| "surface object not discovered".to_string())?;
+
+    let time = monotonic_ms() - state.time_base_ms.load(Ordering::Relaxed);
+
+    let _lock = APP_WRITE_LOCK.lock().unwrap();
+
+    // Send enter before first button if not yet focused.
+    if !state.pointer_focus_sent.swap(true, Ordering::SeqCst) {
+        let serial = next_inject_serial();
+        let enter = encode_pointer_enter(ptr_id, serial, surface_id, 0.0, 0.0);
+        if !write_all(state.app_fd.load(Ordering::Relaxed), &enter) {
+            return Err("write pointer.enter failed".to_string());
+        }
+    }
+
+    let serial = next_inject_serial();
+    let state_code: u32 = if pressed { 1 } else { 0 };
+    let btn_msg = encode_pointer_button(ptr_id, serial, time, button, state_code);
+    if !write_all(state.app_fd.load(Ordering::Relaxed), &btn_msg) {
+        return Err("write pointer.button failed".to_string());
+    }
+
+    // Always emit frame after button events (v5+).
+    let frame = encode_pointer_frame(ptr_id);
+    if !write_all(state.app_fd.load(Ordering::Relaxed), &frame) {
+        return Err("write pointer.frame failed".to_string());
+    }
+
+    Ok(())
+}
+
+/// Inject a pointer axis (scroll) event.
+fn inject_pointer_axis(axis: u32, value: f64) -> Result<(), String> {
+    let state = pump_state();
+
+    let ptr_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .pointer_id
+        .ok_or_else(|| "pointer object not discovered".to_string())?;
+
+    let surface_id = state
+        .sniffer
+        .lock()
+        .unwrap()
+        .surface_id
+        .ok_or_else(|| "surface object not discovered".to_string())?;
+
+    let time = monotonic_ms() - state.time_base_ms.load(Ordering::Relaxed);
+
+    let _lock = APP_WRITE_LOCK.lock().unwrap();
+
+    // Send enter before first scroll if not yet focused.
+    if !state.pointer_focus_sent.swap(true, Ordering::SeqCst) {
+        let serial = next_inject_serial();
+        let enter = encode_pointer_enter(ptr_id, serial, surface_id, 0.0, 0.0);
+        if !write_all(state.app_fd.load(Ordering::Relaxed), &enter) {
+            return Err("write pointer.enter failed".to_string());
+        }
+    }
+
+    let axis_msg = encode_pointer_axis(ptr_id, time, axis, value);
+    if !write_all(state.app_fd.load(Ordering::Relaxed), &axis_msg) {
+        return Err("write pointer.axis failed".to_string());
+    }
+
+    let frame = encode_pointer_frame(ptr_id);
+    if !write_all(state.app_fd.load(Ordering::Relaxed), &frame) {
+        return Err("write pointer.frame failed".to_string());
+    }
+
+    Ok(())
+}
+
+/// Get the next synthetic serial, atomically incrementing.
+fn next_inject_serial() -> u32 {
+    pump_state().next_serial.fetch_add(1, Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — math, time, JSON
+// ---------------------------------------------------------------------------
+
+fn to_fixed(v: f64) -> i32 {
+    (v * 256.0).round() as i32
 }
 
 fn monotonic_ms() -> u32 {
@@ -1367,114 +1187,6 @@ fn monotonic_ms() -> u32 {
     (ts.tv_sec as u32)
         .wrapping_mul(1000)
         .wrapping_add((ts.tv_nsec / 1_000_000) as u32)
-}
-
-fn to_fixed(v: f64) -> i32 {
-    (v * 256.0).round() as i32
-}
-
-fn dispatch_event(_display: *mut c_void, cmd: IpcCommand) {
-    let serial = next_serial();
-    let ms = monotonic_ms();
-    match cmd {
-        IpcCommand::MouseMove { x, y } => {
-            if let Some(ptr) = get_pointer_proxy() {
-                unsafe {
-                    let mut args = [
-                        wl_argument { u: ms },
-                        wl_argument { f: to_fixed(x) },
-                        wl_argument { f: to_fixed(y) },
-                    ];
-                    dispatch_to_proxy(ptr, 2 /* motion */, &mut args);
-                    emit_frame_if_v5(ptr);
-                }
-            }
-        }
-        IpcCommand::MouseButton { button, state } => {
-            if let Some(ptr) = get_pointer_proxy() {
-                unsafe {
-                    let mut args = [
-                        wl_argument { u: serial },
-                        wl_argument { u: ms },
-                        wl_argument { u: button },
-                        wl_argument { u: state },
-                    ];
-                    dispatch_to_proxy(ptr, 3 /* button */, &mut args);
-                    emit_frame_if_v5(ptr);
-                }
-            }
-        }
-        IpcCommand::Key { key, state } => {
-            if let Some(kbd) = get_keyboard_proxy() {
-                unsafe {
-                    let mut args = [
-                        wl_argument { u: serial },
-                        wl_argument { u: ms },
-                        wl_argument { u: key },
-                        wl_argument { u: state },
-                    ];
-                    dispatch_to_proxy(kbd, 3 /* key */, &mut args);
-                }
-            }
-        }
-        IpcCommand::Modifiers { depressed } => {
-            if let Some(kbd) = get_keyboard_proxy() {
-                unsafe {
-                    let mut args = [
-                        wl_argument { u: serial },
-                        wl_argument { u: depressed },
-                        wl_argument { u: 0 }, // mods_latched
-                        wl_argument { u: 0 }, // mods_locked
-                        wl_argument { u: 0 }, // group
-                    ];
-                    dispatch_to_proxy(kbd, 4 /* modifiers */, &mut args);
-                }
-            }
-        }
-        IpcCommand::Scroll { axis, amount } => {
-            if let Some(ptr) = get_pointer_proxy() {
-                unsafe {
-                    let mut args = [
-                        wl_argument { u: ms },
-                        wl_argument { u: axis },
-                        wl_argument {
-                            f: to_fixed(amount),
-                        },
-                    ];
-                    dispatch_to_proxy(ptr, 4 /* axis */, &mut args);
-                    emit_frame_if_v5(ptr);
-                }
-            }
-        }
-    }
-}
-
-fn get_pointer_proxy() -> Option<*mut c_void> {
-    let p = G_POINTER.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(p)
-    }
-}
-
-/// Emit `wl_pointer.frame` (opcode 5) if the pointer protocol version is
-/// ≥ 5.  Works for both dispatcher- and listener-style proxies.
-/// Without the frame, v5+ clients batch motion/button/axis events
-/// and discard them as incomplete.
-unsafe fn emit_frame_if_v5(ptr: *mut c_void) {
-    if (*(ptr as *mut wl_proxy)).version >= 5 {
-        dispatch_to_proxy(ptr, 5 /* frame */, &mut []);
-    }
-}
-
-fn get_keyboard_proxy() -> Option<*mut c_void> {
-    let p = G_KEYBOARD.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(p)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,49 +1215,10 @@ struct IpcRequest {
     value: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
-enum IpcCommand {
-    MouseMove {
-        x: f64,
-        y: f64,
-    },
-    MouseButton {
-        button: u32,
-        state: u32,
-    },
-    Key {
-        key: u32,
-        state: u32,
-    },
-    Modifiers {
-        depressed: u32,
-    },
-    /// Axis scroll event: `axis` is the Wayland axis identifier
-    /// (0=vertical, 1=horizontal), `amount` in logical scroll units.
-    Scroll {
-        axis: u32,
-        amount: f64,
-    },
-}
-
 #[derive(Debug)]
 enum HandleResult {
     Response(String),
     Unload,
-}
-/// Push a command into the queue and wake any blocked poll() in the
-/// target's dispatch thread by writing to the eventfd and sending SIGUSR2.
-unsafe fn enqueue_command(cmd: IpcCommand) {
-    {
-        let mut q = COMMAND_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back(cmd);
-    }
-    let efd = WAKE_EVENTFD.load(Ordering::Acquire);
-    if efd >= 0 {
-        let val: u64 = 1;
-        libc::write(efd, &val as *const u64 as *const c_void, 8);
-    }
-    libc::kill(libc::getpid(), libc::SIGUSR2);
 }
 
 fn parse_state(s: &str) -> u32 {
@@ -1566,56 +1239,74 @@ fn handle_request(line: &str) -> HandleResult {
 
     match req.ty.as_str() {
         "hello" => HandleResult::Response(
-            r#"{"type":"hello_ack","protocol_version":1,"payload_version":"0.2.2"}"#.to_string(),
+            r#"{"type":"hello_ack","protocol_version":1,"payload_version":"0.3.0"}"#.to_string(),
         ),
         "mouse_move" => {
             let x = req.x.unwrap_or(0.0);
             let y = req.y.unwrap_or(0.0);
-            unsafe { enqueue_command(IpcCommand::MouseMove { x, y }); }
-            HandleResult::Response(make_ok())
+            match inject_pointer_move(x, y) {
+                Ok(()) => HandleResult::Response(make_ok()),
+                Err(e) => HandleResult::Response(make_error("inject_failed", &e)),
+            }
         }
         "mouse_button" => {
             let button = req.button.unwrap_or(0);
-            let state = parse_state(&req.state.unwrap_or_default());
-            unsafe { enqueue_command(IpcCommand::MouseButton { button, state }); }
-            HandleResult::Response(make_ok())
+            let pressed = parse_state(&req.state.unwrap_or_default()) == 1;
+            match inject_pointer_button(button, pressed) {
+                Ok(()) => HandleResult::Response(make_ok()),
+                Err(e) => HandleResult::Response(make_error("inject_failed", &e)),
+            }
         }
         "key" => {
             let key = req.key.unwrap_or(0);
-            let state = parse_state(&req.state.unwrap_or_default());
-            unsafe { enqueue_command(IpcCommand::Key { key, state }); }
-            HandleResult::Response(make_ok())
+            let pressed = parse_state(&req.state.unwrap_or_default()) == 1;
+            match inject_key(key, pressed) {
+                Ok(()) => HandleResult::Response(make_ok()),
+                Err(e) => HandleResult::Response(make_error("inject_failed", &e)),
+            }
         }
         "modifiers" => {
             let depressed = req.depressed.unwrap_or(0);
-            unsafe { enqueue_command(IpcCommand::Modifiers { depressed }); }
-            HandleResult::Response(make_ok())
+            match inject_modifiers(depressed) {
+                Ok(()) => HandleResult::Response(make_ok()),
+                Err(e) => HandleResult::Response(make_error("inject_failed", &e)),
+            }
         }
         "scroll" => {
             let axis = req.axis.unwrap_or(0);
             let amount = req.value.unwrap_or(0.0);
-            unsafe { enqueue_command(IpcCommand::Scroll { axis, amount }); }
-            HandleResult::Response(make_ok())
+            match inject_pointer_axis(axis, amount) {
+                Ok(()) => HandleResult::Response(make_ok()),
+                Err(e) => HandleResult::Response(make_error("inject_failed", &e)),
+            }
         }
         "surface_size" => {
-            if G_XDG_TOPLEVEL.load(Ordering::Acquire).is_null() {
+            let state = pump_state();
+            let w = state.surface_w.load(Ordering::Acquire);
+            let h = state.surface_h.load(Ordering::Acquire);
+            if w == 0 && h == 0 {
                 return HandleResult::Response(make_error_with_kind(
                     "proxy_not_found",
-                    "xdg_toplevel not captured yet",
+                    "surface dimensions not captured yet",
                     "xdg_toplevel",
                 ));
             }
-            let w = G_SURFACE_W.load(Ordering::Acquire);
-            let h = G_SURFACE_H.load(Ordering::Acquire);
             HandleResult::Response(format!(r#"{{"status":"ok","width":{},"height":{}}}"#, w, h))
         }
-        "status" => HandleResult::Response(format!(
-            r#"{{"status":"ok","dispatch_hook_installed":{},"poll_hits":{},"eventfd":{},"has_poll_real":{}}}"#,
-            G_DISPATCH_CALLED.load(Ordering::Acquire),
-            POLL_HOOK_COUNT.load(Ordering::Relaxed),
-            WAKE_EVENTFD.load(Ordering::Acquire),
-            REAL_POLL.load(Ordering::Acquire) != 0,
-        )),
+        "status" => {
+            let state = pump_state();
+            let sniffer = state.sniffer.lock().unwrap();
+            HandleResult::Response(format!(
+                r#"{{"status":"ok","pump_running":{},"pointer_id":{},"keyboard_id":{},"surface_id":{},"server_serial":{},"inject_serial":{},"hijack_ok":{}}}"#,
+                state.pump_running.load(Ordering::Acquire),
+                sniffer.pointer_id.map_or("null".to_string(), |id| id.to_string()),
+                sniffer.keyboard_id.map_or("null".to_string(), |id| id.to_string()),
+                sniffer.surface_id.map_or("null".to_string(), |id| id.to_string()),
+                sniffer.last_server_serial,
+                state.next_serial.load(Ordering::Relaxed),
+                state.hijack_ok.load(Ordering::Relaxed),
+            ))
+        }
         "unload" => HandleResult::Unload,
         _ => HandleResult::Response(make_error("unknown_command", &req.ty)),
     }
@@ -1627,14 +1318,8 @@ fn make_ok() -> String {
 
 fn make_error(code: &str, message: &str) -> String {
     let mut m = serde_json::Map::new();
-    m.insert(
-        "status".to_string(),
-        serde_json::Value::String("error".to_string()),
-    );
-    m.insert(
-        "code".to_string(),
-        serde_json::Value::String(code.to_string()),
-    );
+    m.insert("status".to_string(), serde_json::Value::String("error".to_string()));
+    m.insert("code".to_string(), serde_json::Value::String(code.to_string()));
     m.insert(
         "message".to_string(),
         serde_json::Value::String(message.to_string()),
@@ -1644,14 +1329,8 @@ fn make_error(code: &str, message: &str) -> String {
 
 fn make_error_with_kind(code: &str, message: &str, kind: &str) -> String {
     let mut m = serde_json::Map::new();
-    m.insert(
-        "status".to_string(),
-        serde_json::Value::String("error".to_string()),
-    );
-    m.insert(
-        "code".to_string(),
-        serde_json::Value::String(code.to_string()),
-    );
+    m.insert("status".to_string(), serde_json::Value::String("error".to_string()));
+    m.insert("code".to_string(), serde_json::Value::String(code.to_string()));
     m.insert(
         "message".to_string(),
         serde_json::Value::String(message.to_string()),
@@ -1673,9 +1352,10 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// Buffer that holds the socket path passed in by the host.
-/// OnceLock avoids the data race of the previous static mut.
 static BACKSEAT_SOCK_PATH: OnceLock<PathBuf> = OnceLock::new();
+static G_HOST_PID: AtomicU32 = AtomicU32::new(0);
+static IPC_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+static PROBE_FAILED: AtomicBool = AtomicBool::new(false);
 
 fn ipc_thread() {
     let pid = unsafe { libc::getpid() };
@@ -1685,7 +1365,8 @@ fn ipc_thread() {
         .cloned()
         .unwrap_or_else(|| runtime_dir().join(format!("backseat-{}.sock", pid)));
 
-    let sock_path_cstring = std::ffi::CString::new(sock_path.to_string_lossy().as_bytes()).unwrap();
+    let sock_path_cstring =
+        std::ffi::CString::new(sock_path.to_string_lossy().as_bytes()).unwrap();
     let _ = std::fs::remove_file(&sock_path);
 
     let listener = match UnixListener::bind(&sock_path) {
@@ -1700,8 +1381,7 @@ fn ipc_thread() {
         libc::chmod(sock_path_cstring.as_ptr(), 0o700);
     }
 
-    // Enable SO_PASSCRED so we can verify the connecting peer's PID.
-    // This prevents other same-UID processes from driving the target.
+    // Enable SO_PASSCRED for peer credential verification.
     unsafe {
         let one: libc::c_int = 1;
         libc::setsockopt(
@@ -1721,7 +1401,7 @@ fn ipc_thread() {
         }
     };
 
-    // Verify the connecting peer's PID matches the host process.
+    // Verify the connecting peer's PID.
     let host_pid = G_HOST_PID.load(Ordering::Acquire);
     if host_pid != 0 {
         let mut cred: libc::ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
@@ -1775,7 +1455,6 @@ fn ipc_thread() {
         }
         line.clear();
     }
-    // Allow re-injection after unload.
     IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
 }
 
@@ -1783,24 +1462,13 @@ fn ipc_thread() {
 // Constructor
 // ---------------------------------------------------------------------------
 
-/// Set to true if the runtime libwayland probe fails.  When set, the IPC
-/// thread will not start and backseat_init will refuse subsequent injections.
-static PROBE_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// Runtime probe — verify the target's libwayland ABI matches our layout
-/// expectations before we start patching memory.
+/// Runtime probe — verify the target has libwayland loaded.
 unsafe fn probe_libwayland() -> bool {
-    // dlsym for a symbol that has existed in all libwayland 1.x releases.
-    // RTLD_DEFAULT searches the global symbol table (libwayland must be
-    // loaded for the target to be a Wayland client).
     let sym = libc::dlsym(
         libc::RTLD_DEFAULT,
         c"wl_proxy_get_version".as_ptr() as *const c_char,
     );
-    if sym.is_null() {
-        return false;
-    }
-    true
+    !sym.is_null()
 }
 
 #[used]
@@ -1811,57 +1479,12 @@ extern "C" fn init() {
     unsafe {
         if !probe_libwayland() {
             PROBE_FAILED.store(true, Ordering::Release);
-            return;
         }
-        // Create the wake eventfd before patching — the poll hooks will
-        // read it.
-        let efd = libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC);
-        WAKE_EVENTFD.store(efd, Ordering::Release);
-
-        patch_all_gots("wl_display_dispatch", hook_dispatch as *mut c_void);
-        patch_all_gots(
-            "wl_display_dispatch_pending",
-            hook_dispatch_pending as *mut c_void,
-        );
-        patch_all_gots(
-            "wl_display_dispatch_queue",
-            hook_dispatch_queue as *mut c_void,
-        );
-        patch_all_gots(
-            "wl_display_dispatch_queue_pending",
-            hook_dispatch_queue_pending as *mut c_void,
-        );
-        patch_all_gots(
-            "wl_proxy_add_dispatcher",
-            hook_add_dispatcher as *mut c_void,
-        );
-        patch_all_gots(
-            "wl_proxy_add_listener",
-            hook_add_listener as *mut c_void,
-        );
-        patch_all_gots("poll", hook_poll as *mut c_void);
-        patch_all_gots("ppoll", hook_ppoll as *mut c_void);
-
-        // Secondary: also try dl_iterate_phdr for modules goblin missed.
-        // Currently no-op (rust_patch_got_for_module returns 0 immediately).
-        macro_rules! phdr_patch {
-            ($sym:expr, $hook:expr) => {
-                let cs = std::ffi::CString::new($sym).unwrap();
-                patch_gots_via_phdrs(cs.as_ptr(), $hook as *mut c_void);
-            };
-        }
-        phdr_patch!("wl_display_dispatch", hook_dispatch);
-        phdr_patch!("wl_display_dispatch_pending", hook_dispatch_pending);
-        phdr_patch!("wl_display_dispatch_queue", hook_dispatch_queue);
-        phdr_patch!("wl_display_dispatch_queue_pending", hook_dispatch_queue_pending);
-        phdr_patch!("wl_proxy_add_dispatcher", hook_add_dispatcher);
-        phdr_patch!("wl_proxy_add_listener", hook_add_listener);
-        phdr_patch!("poll", hook_poll);
-        phdr_patch!("ppoll", hook_ppoll);
     }
 }
 
-/// Host-visible entry point. Receives the Unix-socket path and starts IPC.
+/// Host-visible entry point. Receives the Unix-socket path and starts
+/// the fd hijack, pump thread, and IPC thread.
 ///
 /// # Safety
 /// `path` must be a valid null-terminated UTF-8 string.
@@ -1872,15 +1495,8 @@ pub unsafe extern "C" fn backseat_init(path: *const c_char) {
         if let Ok(s) = cstr.to_str() {
             let _ = BACKSEAT_SOCK_PATH.set(PathBuf::from(s));
         }
-        // The host PID is written immediately after the socket path's
-        // null terminator in the target's memory (see injector.rs).
         let host_pid_ptr = path.add(cstr.to_bytes_with_nul().len()).cast::<u32>();
         G_HOST_PID.store(host_pid_ptr.read_unaligned(), Ordering::SeqCst);
-    }
-
-    extern "C" fn ipc_thread_wrapper(_arg: *mut c_void) -> *mut c_void {
-        ipc_thread();
-        std::ptr::null_mut()
     }
 
     if PROBE_FAILED.load(Ordering::Acquire) {
@@ -1891,17 +1507,50 @@ pub unsafe extern "C" fn backseat_init(path: *const c_char) {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        unsafe {
-            let mut tid: libc::pthread_t = 0;
-            let ret = libc::pthread_create(
-                &mut tid,
-                std::ptr::null(),
-                ipc_thread_wrapper,
-                std::ptr::null_mut(),
-            );
-            if ret != 0 {
-                IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
+        // Find and hijack the Wayland fd.
+        let state = pump_state();
+        if let Some(wl_fd) = find_wayland_fd() {
+            if let Some(hijack) = hijack_fd(wl_fd) {
+                state.app_fd.store(hijack.ours_fd, Ordering::Release);
+                state.hijack_ok.store(true, Ordering::Release);
+
+                // Spawn pump thread.
+                let stash_fd = hijack.stash_fd;
+                let ours_fd = hijack.ours_fd;
+                let mut pump_tid: libc::pthread_t = 0;
+                extern "C" fn pump_wrapper(arg: *mut c_void) -> *mut c_void {
+                    let fds: &(c_int, c_int) = unsafe { &*(arg as *const (c_int, c_int)) };
+                    pump_loop(fds.0, fds.1);
+                    std::ptr::null_mut()
+                }
+                let fds = Box::new((stash_fd, ours_fd));
+                let ret = libc::pthread_create(
+                    &mut pump_tid,
+                    std::ptr::null(),
+                    pump_wrapper,
+                    Box::into_raw(fds) as *mut c_void,
+                );
+                if ret != 0 {
+                    // Pump failed — still start IPC for graceful error reporting.
+                }
+                libc::pthread_detach(pump_tid);
             }
+        }
+
+        // Spawn IPC thread.
+        let mut tid: libc::pthread_t = 0;
+        extern "C" fn ipc_thread_wrapper(_arg: *mut c_void) -> *mut c_void {
+            ipc_thread();
+            std::ptr::null_mut()
+        }
+        let ret = libc::pthread_create(
+            &mut tid,
+            std::ptr::null(),
+            ipc_thread_wrapper,
+            std::ptr::null_mut(),
+        );
+        if ret != 0 {
+            IPC_THREAD_STARTED.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -1913,365 +1562,6 @@ pub unsafe extern "C" fn backseat_init(path: *const c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
-
-    /// Tests that touch `COMMAND_QUEUE` must run sequentially because
-    /// the queue is a process-global `Mutex`.  This lock serialises
-    /// entry to every test in the module.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    // -----------------------------------------------------------------------
-    // invoke_listener — synthetic proxy construction helpers
-    // -----------------------------------------------------------------------
-
-    /// Captured arguments from a listener callback invocation.
-    /// Recorded by the synthetic vtable functions below.
-    static LAST_LISTENER_ARGS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
-
-    /// Synthetic user-data value that the test should see passed as the
-    /// first argument to the listener callback.
-    const FAKE_USER_DATA: *mut c_void = 0x7fdead_0000 as *mut c_void;
-
-    // Synthetic listener callbacks — each records its arguments into
-    // LAST_LISTENER_ARGS so tests can assert correctness.
-
-    unsafe extern "C" fn test_listener_no_args(data: *mut c_void, _proxy: *mut c_void) {
-        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
-        v.push(data as u64);
-    }
-
-    unsafe extern "C" fn test_listener_motion(
-        data: *mut c_void,
-        _proxy: *mut c_void,
-        time: u32,
-        x: i32,
-        y: i32,
-    ) {
-        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
-        v.push(data as u64);
-        v.push(time as u64);
-        v.push(x as u32 as u64);
-        v.push(y as u32 as u64);
-    }
-
-    unsafe extern "C" fn test_listener_button(
-        data: *mut c_void,
-        _proxy: *mut c_void,
-        serial: u32,
-        time: u32,
-        button: u32,
-        state: u32,
-    ) {
-        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
-        v.push(data as u64);
-        v.push(serial as u64);
-        v.push(time as u64);
-        v.push(button as u64);
-        v.push(state as u64);
-    }
-
-    unsafe extern "C" fn test_listener_axis(
-        data: *mut c_void,
-        _proxy: *mut c_void,
-        time: u32,
-        axis: u32,
-        value: i32,
-    ) {
-        let mut v = LAST_LISTENER_ARGS.lock().unwrap();
-        v.push(data as u64);
-        v.push(time as u64);
-        v.push(axis as u64);
-        v.push(value as u32 as u64);
-    }
-
-    /// Build a synthetic `wl_proxy` with listener-style registration.
-    /// `vtable` is a pointer to an array of `n` function pointers.
-    /// The proxy's `dispatcher` is set to null, `user_data` to
-    /// `FAKE_USER_DATA`, and `object.implementation` to the vtable.
-    unsafe fn make_listener_proxy(vtable: *const usize, version: u32) -> wl_proxy {
-        wl_proxy {
-            object: wl_object {
-                interface: std::ptr::null(),
-                implementation: vtable as *const c_void,
-                id: 0,
-                _pad: 0,
-            },
-            display: std::ptr::null_mut(),
-            queue: std::ptr::null_mut(),
-            flags: 0,
-            refcount: 0,
-            user_data: FAKE_USER_DATA,
-            dispatcher: std::ptr::null_mut(),
-            version,
-            _pad: 0,
-            tag: std::ptr::null(),
-            queue_link: wl_list {
-                prev: std::ptr::null_mut(),
-                next: std::ptr::null_mut(),
-            },
-        }
-    }
-
-    /// Build a synthetic `wl_proxy` with dispatcher-style registration.
-    unsafe fn make_dispatcher_proxy() -> wl_proxy {
-        wl_proxy {
-            object: wl_object {
-                interface: std::ptr::null(),
-                implementation: std::ptr::null(),
-                id: 0,
-                _pad: 0,
-            },
-            display: std::ptr::null_mut(),
-            queue: std::ptr::null_mut(),
-            flags: 0,
-            refcount: 0,
-            user_data: std::ptr::null_mut(),
-            dispatcher: std::ptr::dangling_mut::<c_void>(),
-            version: 1,
-            _pad: 0,
-            tag: std::ptr::null(),
-            queue_link: wl_list {
-                prev: std::ptr::null_mut(),
-                next: std::ptr::null_mut(),
-            },
-        }
-    }
-
-    /// Clear the captured listener args before a test.
-    fn clear_listener_args() {
-        LAST_LISTENER_ARGS.lock().unwrap().clear();
-    }
-
-    // -----------------------------------------------------------------------
-    // invoke_listener — marshalling correctness
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn invoke_listener_dispatches_motion() {
-        let _g = lock();
-        clear_listener_args();
-
-        // vtable[2] = test_listener_motion
-        let mut vtable = [0usize; 6];
-        vtable[2] = test_listener_motion as usize;
-
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-
-        let mut args = [
-            wl_argument { u: 0x1000 },   // time = 4096
-            wl_argument { f: 0x200 },    // x = 0x200 as wl_fixed
-            wl_argument { f: -0x100 },   // y = -0x100 as wl_fixed
-        ];
-
-        let ok = unsafe { invoke_listener(ptr, 2 /* motion */, &args) };
-        assert!(ok, "invoke_listener should return true for motion");
-
-        let captured = LAST_LISTENER_ARGS.lock().unwrap();
-        assert_eq!(captured.len(), 4);
-        assert_eq!(captured[0], FAKE_USER_DATA as u64, "data should be user_data, not vtable[1]");
-        assert_eq!(captured[1], 0x1000, "time mismatch");
-        assert_eq!(captured[2] as i32, 0x200, "x (wl_fixed) mismatch");
-        assert_eq!(captured[3] as i32, -0x100, "y (wl_fixed) mismatch");
-    }
-
-    #[test]
-    fn invoke_listener_dispatches_button() {
-        let _g = lock();
-        clear_listener_args();
-
-        let mut vtable = [0usize; 6];
-        vtable[3] = test_listener_button as usize;
-
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-
-        let mut args = [
-            wl_argument { u: 1234 },   // serial
-            wl_argument { u: 5678 },   // time
-            wl_argument { u: 272 },    // button (BTN_LEFT)
-            wl_argument { u: 1 },      // state (pressed)
-        ];
-
-        let ok = unsafe { invoke_listener(ptr, 3 /* button */, &args) };
-        assert!(ok);
-
-        let captured = LAST_LISTENER_ARGS.lock().unwrap();
-        assert_eq!(captured.len(), 5);
-        assert_eq!(captured[0], FAKE_USER_DATA as u64);
-        assert_eq!(captured[1], 1234);
-        assert_eq!(captured[2], 5678);
-        assert_eq!(captured[3], 272);
-        assert_eq!(captured[4], 1);
-    }
-
-    #[test]
-    fn invoke_listener_dispatches_axis() {
-        let _g = lock();
-        clear_listener_args();
-
-        let mut vtable = [0usize; 6];
-        vtable[4] = test_listener_axis as usize;
-
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-
-        // pointer.axis: time, axis, value
-        let mut args = [
-            wl_argument { u: 999 },         // time
-            wl_argument { u: 0 },           // axis = vertical
-            wl_argument { f: to_fixed(10.0) }, // value = 10.0 in wl_fixed
-        ];
-
-        let ok = unsafe { invoke_listener(ptr, 4 /* axis */, &args) };
-        assert!(ok);
-
-        let captured = LAST_LISTENER_ARGS.lock().unwrap();
-        assert_eq!(captured.len(), 4);
-        assert_eq!(captured[0], FAKE_USER_DATA as u64);
-        assert_eq!(captured[1], 999);
-        assert_eq!(captured[2], 0);         // axis = vertical
-        assert_eq!(captured[3] as u32, 2560); // 10.0 in wl_fixed = 2560
-    }
-
-    #[test]
-    fn invoke_listener_dispatches_frame() {
-        let _g = lock();
-        clear_listener_args();
-
-        let mut vtable = [0usize; 6];
-        vtable[5] = test_listener_no_args as usize;
-
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-
-        let ok = unsafe { invoke_listener(ptr, 5 /* frame */, &mut []) };
-        assert!(ok);
-
-        let captured = LAST_LISTENER_ARGS.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0], FAKE_USER_DATA as u64);
-    }
-
-    // -----------------------------------------------------------------------
-    // invoke_listener — error / edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn invoke_listener_returns_false_when_dispatcher_present() {
-        let mut proxy = unsafe { make_dispatcher_proxy() };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-        let ok = unsafe { invoke_listener(ptr, 2, &mut []) };
-        assert!(!ok, "listener path must not handle dispatcher-style proxies");
-    }
-
-    #[test]
-    fn invoke_listener_returns_false_when_vtable_null() {
-        let mut proxy = wl_proxy {
-            object: wl_object {
-                interface: std::ptr::null(),
-                implementation: std::ptr::null(),
-                id: 0,
-                _pad: 0,
-            },
-            display: std::ptr::null_mut(),
-            queue: std::ptr::null_mut(),
-            flags: 0,
-            refcount: 0,
-            user_data: std::ptr::null_mut(),
-            dispatcher: std::ptr::null_mut(),
-            version: 1,
-            _pad: 0,
-            tag: std::ptr::null(),
-            queue_link: wl_list {
-                prev: std::ptr::null_mut(),
-                next: std::ptr::null_mut(),
-            },
-        };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-        let ok = unsafe { invoke_listener(ptr, 2, &mut []) };
-        assert!(!ok);
-    }
-
-    #[test]
-    fn invoke_listener_returns_false_when_slot_empty() {
-        let _g = lock();
-        let mut vtable = [0usize; 6]; // slot 2 is 0 (NULL)
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-        let ok = unsafe { invoke_listener(ptr, 2, &mut []) };
-        assert!(!ok, "empty vtable slot should return false");
-    }
-
-    #[test]
-    fn invoke_listener_returns_false_for_unknown_opcode() {
-        let _g = lock();
-        let mut vtable = [0usize; 6];
-        vtable[2] = test_listener_motion as usize;
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-        let ok = unsafe { invoke_listener(ptr, 999 /* nonexistent */, &mut []) };
-        assert!(!ok);
-    }
-
-    #[test]
-    fn invoke_listener_passes_user_data_not_vtable_1() {
-        let _g = lock();
-        clear_listener_args();
-
-        let mut vtable = [0usize; 6];
-        // Put a different pointer at vtable[1] — the test verifies
-        // that user_data is still passed, NOT this vtable entry.
-        vtable[1] = 0xdead_0001_0000_0001;
-        vtable[2] = test_listener_motion as usize;
-
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        // Set user_data to a known value different from vtable[1].
-        proxy.user_data = FAKE_USER_DATA;
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-
-        let mut args = [
-            wl_argument { u: 1 },
-            wl_argument { f: 0 },
-            wl_argument { f: 0 },
-        ];
-        let ok = unsafe { invoke_listener(ptr, 2 /* motion */, &args) };
-        assert!(ok);
-
-        let captured = LAST_LISTENER_ARGS.lock().unwrap();
-        assert_eq!(
-            captured[0], FAKE_USER_DATA as u64,
-            "data arg must come from proxy.user_data, not vtable[1]"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // dispatch_to_proxy — style-agnostic routing
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn dispatch_to_proxy_falls_back_to_listener() {
-        let _g = lock();
-        clear_listener_args();
-
-        let mut vtable = [0usize; 6];
-        vtable[2] = test_listener_motion as usize;
-
-        let mut proxy = unsafe { make_listener_proxy(vtable.as_ptr(), 1) };
-        let ptr = &mut proxy as *mut wl_proxy as *mut c_void;
-
-        let mut args = [
-            wl_argument { u: 42 },
-            wl_argument { f: 100 },
-            wl_argument { f: 200 },
-        ];
-
-        let ok = unsafe { dispatch_to_proxy(ptr, 2, &mut args) };
-        assert!(ok, "dispatch_to_proxy should try listener after dispatcher fails");
-        let captured = LAST_LISTENER_ARGS.lock().unwrap();
-        assert_eq!(captured[1], 42, "time should be passed to listener");
-    }
-
 
     // -----------------------------------------------------------------------
     // to_fixed
@@ -2295,22 +1585,11 @@ mod tests {
         assert_eq!(to_fixed(0.0), 0);
     }
 
-    // -----------------------------------------------------------------------
-    // monotonic_ms / next_serial
-    // -----------------------------------------------------------------------
-
     #[test]
     fn monotonic_ms_is_monotonic() {
         let a = monotonic_ms();
         let b = monotonic_ms();
         assert!(b >= a, "monotonic_ms went backwards: {a} -> {b}");
-    }
-
-    #[test]
-    fn next_serial_increments() {
-        let s1 = next_serial();
-        let s2 = next_serial();
-        assert!(s2 > s1, "serial did not increment: {s1} -> {s2}");
     }
 
     // -----------------------------------------------------------------------
@@ -2340,239 +1619,370 @@ mod tests {
     #[test]
     fn make_ok_produces_valid_json() {
         let json = make_ok();
-        let v: Value = serde_json::from_str(&json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], "ok");
     }
 
     #[test]
     fn make_error_produces_valid_json() {
         let json = make_error("proxy_not_found", "no pointer");
-        let v: Value = serde_json::from_str(&json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["status"], "error");
         assert_eq!(v["code"], "proxy_not_found");
         assert_eq!(v["message"], "no pointer");
     }
 
-    /// The host's `Response` struct must be able to deserialize
-    /// make_error output.  Verify the exact field names match.
     #[test]
     fn make_error_roundtrips_with_host_response() {
         let json = make_error("bad_cmd", "test message");
-        let v: Value = serde_json::from_str(&json).unwrap();
-        // The host crate source maps these fields as:
-        //   status, code, message
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("status").is_some());
         assert!(v.get("code").is_some());
         assert!(v.get("message").is_some());
     }
 
-    /// Acquire the serialisation lock for tests that touch global state
-    /// (COMMAND_QUEUE, G_* atomics).
-    fn lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap()
+    // -----------------------------------------------------------------------
+    // Wire message header encoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wire_header_basic() {
+        let [id, sop] = wire_header(42, 3, 4);
+        assert_eq!(id, 42);
+        // total_size = 8 + 4*4 = 24 bytes
+        // size_opcode = (24 << 16) | 3 = 0x0018_0003
+        assert_eq!(sop, (24 << 16) | 3);
     }
 
-    /// Send a JSON line to handle_request.  The caller must hold
-    /// TEST_LOCK.  Returns the parsed response and drains any commands
-    /// that were enqueued into a Vec.
-    fn send(line: &str) -> (Value, Vec<IpcCommand>) {
-        COMMAND_QUEUE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        let resp = match handle_request(line) {
-            HandleResult::Response(s) => serde_json::from_str(&s).unwrap(),
-            HandleResult::Unload => {
-                let mut m = serde_json::Map::new();
-                m.insert(
-                    "status".to_string(),
-                    serde_json::Value::String("ok".to_string()),
-                );
-                serde_json::Value::Object(m)
-            }
-        };
-        let cmds: Vec<IpcCommand> = COMMAND_QUEUE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect();
-        (resp, cmds)
+    #[test]
+    fn wire_header_zero_args() {
+        let [id, sop] = wire_header(1, 5, 0);
+        assert_eq!(id, 1);
+        // total_size = 8 + 0 = 8
+        // size_opcode = (8 << 16) | 5 = 0x0008_0005
+        assert_eq!(sop, (8 << 16) | 5);
     }
 
     // -----------------------------------------------------------------------
-    // handle_request — hello
+    // Encoder round-trip tests (AC6)
+    // -----------------------------------------------------------------------
+
+    /// Parse a complete message from a byte buffer and return field values
+    /// for verification.
+    fn parse_encoded(bytes: &[u8]) -> (u32, u16, u32, Vec<u32>) {
+        let (msg, _) = parse_message(bytes).expect("should parse encoded message");
+        (msg.object_id, msg.opcode, msg.size_bytes, msg.args)
+    }
+
+    #[test]
+    fn encode_roundtrip_pointer_motion() {
+        let bytes = encode_pointer_motion(7, 1000, 12.5, -3.25);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 7);
+        assert_eq!(opcode, 2);
+        assert_eq!(size, 20);
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], 1000); // time
+        assert_eq!(args[1] as i32, to_fixed(12.5)); // x in wl_fixed
+        assert_eq!(args[2] as i32, to_fixed(-3.25)); // y in wl_fixed
+    }
+
+    #[test]
+    fn encode_roundtrip_pointer_button() {
+        let bytes = encode_pointer_button(7, 123, 500, 0x110, 1);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 7);
+        assert_eq!(opcode, 3);
+        assert_eq!(size, 24);
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], 123); // serial
+        assert_eq!(args[1], 500); // time
+        assert_eq!(args[2], 0x110); // button (BTN_LEFT)
+        assert_eq!(args[3], 1); // state (pressed)
+    }
+
+    #[test]
+    fn encode_roundtrip_pointer_axis() {
+        let bytes = encode_pointer_axis(7, 2000, 0, 10.0);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 7);
+        assert_eq!(opcode, 4);
+        assert_eq!(size, 20);
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], 2000); // time
+        assert_eq!(args[1], 0); // axis = vertical
+        assert_eq!(args[2] as i32, to_fixed(10.0)); // value in wl_fixed
+    }
+
+    #[test]
+    fn encode_roundtrip_pointer_frame() {
+        let bytes = encode_pointer_frame(7);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 7);
+        assert_eq!(opcode, 5);
+        assert_eq!(size, 8);
+        assert_eq!(args.len(), 0);
+    }
+
+    #[test]
+    fn encode_roundtrip_pointer_enter() {
+        let bytes = encode_pointer_enter(7, 1, 5, 100.0, 200.0);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 7);
+        assert_eq!(opcode, 0);
+        assert_eq!(size, 24);
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], 1); // serial
+        assert_eq!(args[1], 5); // surface
+        assert_eq!(args[2] as i32, to_fixed(100.0)); // x
+        assert_eq!(args[3] as i32, to_fixed(200.0)); // y
+    }
+
+    #[test]
+    fn encode_roundtrip_keyboard_key() {
+        let bytes = encode_keyboard_key(8, 42, 3000, 30, 1);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 8);
+        assert_eq!(opcode, 3);
+        assert_eq!(size, 24);
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], 42); // serial
+        assert_eq!(args[1], 3000); // time
+        assert_eq!(args[2], 30); // key (KEY_A)
+        assert_eq!(args[3], 1); // state (pressed)
+    }
+
+    #[test]
+    fn encode_roundtrip_keyboard_modifiers() {
+        let bytes = encode_keyboard_modifiers(8, 55, 0x01, 0, 0, 0);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 8);
+        assert_eq!(opcode, 4);
+        assert_eq!(size, 28);
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], 55); // serial
+        assert_eq!(args[1], 0x01); // depressed
+        assert_eq!(args[2], 0); // latched
+        assert_eq!(args[3], 0); // locked
+        assert_eq!(args[4], 0); // group
+    }
+
+    #[test]
+    fn encode_roundtrip_keyboard_enter_empty_keys() {
+        // Enter with empty keys array — the test verifies the array
+        // padding is correct (4 bytes for the empty array length).
+        let bytes = encode_keyboard_enter(8, 1, 5, &[]);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 8);
+        assert_eq!(opcode, 1);
+        // 8 header + serial(4) + surface(4) + array_len(4) + 0 array data = 20 bytes
+        assert_eq!(size, 20);
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], 1); // serial
+        assert_eq!(args[1], 5); // surface
+        assert_eq!(args[2], 0); // keys array length = 0
+    }
+
+    #[test]
+    fn encode_roundtrip_keyboard_enter_with_keys() {
+        // Enter with keys [30, 31] (key A and key S).
+        let bytes = encode_keyboard_enter(8, 1, 5, &[30, 31]);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 8);
+        assert_eq!(opcode, 1);
+        // 8 header + serial(4) + surface(4) + array_len(4) + 2*4 keys = 28 bytes
+        assert_eq!(size, 28);
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], 1); // serial
+        assert_eq!(args[1], 5); // surface
+        assert_eq!(args[2], 8); // keys array length = 2 u32 = 8 bytes
+        assert_eq!(args[3], 30); // first key
+        assert_eq!(args[4], 31); // second key
+    }
+
+    #[test]
+    fn encode_roundtrip_keyboard_leave() {
+        let bytes = encode_keyboard_leave(8, 1, 5);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 8);
+        assert_eq!(opcode, 2);
+        assert_eq!(size, 16);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], 1); // serial
+        assert_eq!(args[1], 5); // surface
+    }
+
+    #[test]
+    fn encode_roundtrip_pointer_leave() {
+        let bytes = encode_pointer_leave(7, 1, 5);
+        let (id, opcode, size, args) = parse_encoded(&bytes);
+        assert_eq!(id, 7);
+        assert_eq!(opcode, 1);
+        assert_eq!(size, 16);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], 1); // serial
+        assert_eq!(args[1], 5); // surface
+    }
+
+    // -----------------------------------------------------------------------
+    // wl_fixed round-trip in encoder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wl_fixed_roundtrip_in_encoder() {
+        // Verify that wl_fixed values survive encode → parse round-trip.
+        let test_values = [0.0, 1.0, -1.0, 0.5, -0.5, 100.25, -99.75, 3.14159];
+        for &val in &test_values {
+            let bytes = encode_pointer_motion(1, 0, val, val);
+            let (_, _, _, args) = parse_encoded(&bytes);
+            assert_eq!(
+                args[1] as i32,
+                to_fixed(val),
+                "wl_fixed round-trip failed for {val}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Wire message parser
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_message_complete() {
+        let bytes = encode_pointer_motion(5, 100, 1.0, 2.0);
+        let (msg, consumed) = parse_message(&bytes).unwrap();
+        assert_eq!(msg.object_id, 5);
+        assert_eq!(msg.opcode, 2);
+        assert_eq!(consumed, 20);
+    }
+
+    #[test]
+    fn parse_message_incomplete() {
+        // Only 4 bytes — not enough for a header.
+        assert!(parse_message(&[0u8; 4]).is_none());
+        // Header only (8 bytes) with declared size 24 — not enough data.
+        let mut buf = Vec::new();
+        push_u32(&mut buf, 5); // object_id
+        push_u32(&mut buf, (24 << 16) | 2); // size_opcode
+        assert!(parse_message(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_message_zero_args() {
+        let bytes = encode_pointer_frame(7);
+        let (msg, consumed) = parse_message(&bytes).unwrap();
+        assert_eq!(consumed, 8);
+        assert_eq!(msg.args.len(), 0);
+        assert_eq!(msg.opcode, 5);
+    }
+
+    #[test]
+    fn parse_message_multiple_in_buffer() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&encode_pointer_frame(1));
+        buf.extend_from_slice(&encode_pointer_motion(1, 500, 10.0, 20.0));
+
+        // Parse first message.
+        let (msg1, consumed1) = parse_message(&buf).unwrap();
+        assert_eq!(consumed1, 8);
+        assert_eq!(msg1.opcode, 5);
+
+        // Parse second message.
+        let (msg2, consumed2) = parse_message(&buf[consumed1..]).unwrap();
+        assert_eq!(consumed2, 20);
+        assert_eq!(msg2.opcode, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sniffer — object identification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sniffer_identifies_pointer_from_motion() {
+        let mut s = Sniffer::new();
+        let msg = WireMessage {
+            object_id: 7,
+            opcode: 2,
+            args: vec![1000, to_fixed(10.0) as u32, to_fixed(20.0) as u32],
+            size_bytes: 20,
+        };
+        s.feed_server_event(&msg);
+        assert_eq!(s.pointer_id, Some(7));
+        assert_eq!(s.objects.get(&7), Some(&ObjectKind::WlPointer));
+    }
+
+    #[test]
+    fn sniffer_identifies_keyboard_from_modifiers() {
+        let mut s = Sniffer::new();
+        let msg = WireMessage {
+            object_id: 8,
+            opcode: 4,
+            args: vec![1, 0, 0, 0, 0],
+            size_bytes: 28,
+        };
+        s.feed_server_event(&msg);
+        assert_eq!(s.keyboard_id, Some(8));
+        assert_eq!(s.objects.get(&8), Some(&ObjectKind::WlKeyboard));
+    }
+
+    #[test]
+    fn sniffer_identifies_surface_from_pointer_enter() {
+        let mut s = Sniffer::new();
+        let msg = WireMessage {
+            object_id: 7,
+            opcode: 0,
+            args: vec![1, 5, to_fixed(0.0) as u32, to_fixed(0.0) as u32],
+            size_bytes: 24,
+        };
+        s.feed_server_event(&msg);
+        assert_eq!(s.surface_id, Some(5));
+        assert_eq!(s.objects.get(&5), Some(&ObjectKind::WlSurface));
+        assert_eq!(s.pointer_id, Some(7));
+    }
+
+    #[test]
+    fn sniffer_tracks_server_serial() {
+        let mut s = Sniffer::new();
+        let msg = WireMessage {
+            object_id: 7,
+            opcode: 0,
+            args: vec![42, 5, 0, 0],
+            size_bytes: 24,
+        };
+        s.feed_server_event(&msg);
+        assert_eq!(s.last_server_serial, 42);
+    }
+
+    #[test]
+    fn sniffer_identifies_surface_from_keyboard_enter() {
+        let mut s = Sniffer::new();
+        let msg = WireMessage {
+            object_id: 8,
+            opcode: 1,
+            args: vec![1, 5, 0],
+            size_bytes: 20,
+        };
+        s.feed_server_event(&msg);
+        assert_eq!(s.surface_id, Some(5));
+        assert_eq!(s.keyboard_id, Some(8));
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_request
     // -----------------------------------------------------------------------
 
     #[test]
     fn handle_hello() {
-        let _g = lock();
-        let (resp, _) = send(r#"{"type":"hello"}"#);
-        assert_eq!(resp["type"], "hello_ack");
-        assert_eq!(resp["protocol_version"], 1);
-        assert!(resp.get("payload_version").is_some());
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_request — mouse_move
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn handle_mouse_move_enqueues_command() {
-        let _g = lock();
-        let (resp, cmds) = send(r#"{"type":"mouse_move","x":100.5,"y":200.3}"#);
-        assert_eq!(resp["status"], "ok");
-        assert_eq!(cmds.len(), 1);
-        match &cmds[0] {
-            IpcCommand::MouseMove { x, y } => {
-                assert!((x - 100.5).abs() < 0.001);
-                assert!((y - 200.3).abs() < 0.001);
+        match handle_request(r#"{"type":"hello"}"#) {
+            HandleResult::Response(resp) => {
+                let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                assert_eq!(v["type"], "hello_ack");
+                assert_eq!(v["protocol_version"], 1);
+                assert!(v.get("payload_version").is_some());
             }
-            other => panic!("expected MouseMove, got {other:?}"),
+            other => panic!("expected Response, got {other:?}"),
         }
     }
-
-    #[test]
-    fn handle_mouse_move_missing_coords_defaults_to_zero() {
-        let _g = lock();
-        let (resp, cmds) = send(r#"{"type":"mouse_move"}"#);
-        assert_eq!(resp["status"], "ok");
-        match &cmds[0] {
-            IpcCommand::MouseMove { x, y } => {
-                assert_eq!(*x, 0.0);
-                assert_eq!(*y, 0.0);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_request — mouse_button
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn handle_mouse_button_pressed() {
-        let _g = lock();
-        let (resp, cmds) = send(r#"{"type":"mouse_button","button":272,"state":"pressed"}"#);
-        assert_eq!(resp["status"], "ok");
-        match &cmds[0] {
-            IpcCommand::MouseButton { button, state } => {
-                assert_eq!(*button, 272);
-                assert_eq!(*state, 1);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn handle_mouse_button_released() {
-        let _g = lock();
-        let (resp, cmds) = send(r#"{"type":"mouse_button","button":273,"state":"released"}"#);
-        assert_eq!(resp["status"], "ok");
-        match &cmds[0] {
-            IpcCommand::MouseButton { button, state } => {
-                assert_eq!(*button, 273);
-                assert_eq!(*state, 0);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_request — key
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn handle_key_pressed() {
-        let _g = lock();
-        let (resp, cmds) = send(r#"{"type":"key","key":30,"state":"pressed"}"#);
-        assert_eq!(resp["status"], "ok");
-        match &cmds[0] {
-            IpcCommand::Key { key, state } => {
-                assert_eq!(*key, 30);
-                assert_eq!(*state, 1);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn handle_key_missing_fields_defaults() {
-        let _g = lock();
-        let (resp, cmds) = send(r#"{"type":"key"}"#);
-        assert_eq!(resp["status"], "ok");
-        match &cmds[0] {
-            IpcCommand::Key { key, state } => {
-                assert_eq!(*key, 0);
-                assert_eq!(*state, 0);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_request — modifiers
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn handle_modifiers() {
-        let _g = lock();
-        let (resp, cmds) = send(r#"{"type":"modifiers","depressed":1}"#);
-        assert_eq!(resp["status"], "ok");
-        match &cmds[0] {
-            IpcCommand::Modifiers { depressed } => assert_eq!(*depressed, 1),
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_request — surface_size
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn handle_surface_size_without_toplevel() {
-        let _g = lock();
-        let (resp, _) = send(r#"{"type":"surface_size"}"#);
-        assert_eq!(resp["status"], "error");
-        assert_eq!(resp["code"], "proxy_not_found");
-    }
-
-    #[test]
-    fn handle_surface_size_with_toplevel() {
-        let _g = lock();
-        G_XDG_TOPLEVEL.store(std::ptr::dangling_mut::<c_void>(), Ordering::Release);
-        G_SURFACE_W.store(1920, Ordering::Release);
-        G_SURFACE_H.store(1080, Ordering::Release);
-
-        let (resp, _) = send(r#"{"type":"surface_size"}"#);
-        assert_eq!(resp["status"], "ok");
-        assert_eq!(resp["width"], 1920);
-        assert_eq!(resp["height"], 1080);
-
-        G_XDG_TOPLEVEL.store(std::ptr::null_mut(), Ordering::Release);
-        G_SURFACE_W.store(0, Ordering::Release);
-        G_SURFACE_H.store(0, Ordering::Release);
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_request — status
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn handle_status_reports_dispatch_hook() {
-        let _g = lock();
-        G_DISPATCH_CALLED.store(true, Ordering::Release);
-        let (resp, _) = send(r#"{"type":"status"}"#);
-        assert_eq!(resp["status"], "ok");
-        assert_eq!(resp["dispatch_hook_installed"], true);
-
-        G_DISPATCH_CALLED.store(false, Ordering::Release);
-        let (resp, _) = send(r#"{"type":"status"}"#);
-        assert_eq!(resp["dispatch_hook_installed"], false);
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_request — unload
-    // -----------------------------------------------------------------------
 
     #[test]
     fn handle_unload_returns_unload_variant() {
@@ -2582,108 +1992,85 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // handle_request — error cases
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn handle_request_malformed_json() {
-        let _g = lock();
-        let (resp, _) = send("not json at all");
-        assert_eq!(resp["status"], "error");
-        assert_eq!(resp["code"], "invalid_json");
-    }
-
-    #[test]
-    fn handle_request_unknown_command() {
-        let _g = lock();
-        let (resp, _) = send(r#"{"type":"nonexistent_cmd"}"#);
-        assert_eq!(resp["status"], "error");
-        assert_eq!(resp["code"], "unknown_command");
-    }
-
-    // -----------------------------------------------------------------------
-    // sweep crash-guard — mmap-based fault injection
-    // -----------------------------------------------------------------------
-
-    /// Verify that `try_capture` catches a SIGSEGV from a stale
-    /// interface name deref (the 3-link chain proxy → interface →
-    /// name → strlen) and reports it as skipped.
-    ///
-    /// We mmap two pages:
-    ///  - page 1: fake wl_proxy + fake wl_interface
-    ///  - page 2: the string the interface name points to
-    /// Then we munmap page 2 so strlen on the name pointer faults.
-    /// try_capture must return false (skipped) and SWEEP_SKIPPED
-    /// must be > 0, proving the sigsetjmp/longjmp round-trip works.
-    #[test]
-    fn try_capture_skips_stale_interface_name_strlen_fault() {
-        let _g = lock();
-        let page_size = 4096;
-
-        unsafe {
-            // Map two consecutive pages.
-            let region = libc::mmap(
-                std::ptr::null_mut(),
-                2 * page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            assert_ne!(region, libc::MAP_FAILED, "mmap failed");
-
-            let page1 = region as usize;
-            let page2 = page1 + page_size;
-
-            // Write "wl_pointer" at the start of page 2 — this is what
-            // the fake interface.name will point to.  After we munmap
-            // page 2, strlen on this address will fault.
-            let name_bytes = b"wl_pointer\0";
-            std::ptr::copy_nonoverlapping(
-                name_bytes.as_ptr(),
-                page2 as *mut u8,
-                name_bytes.len(),
-            );
-
-            // Build a fake wl_interface on page 1: name → page 2.
-            let iface_ptr = page1 as *mut wl_interface;
-            (*iface_ptr).name = page2 as *const c_char;
-            (*iface_ptr).version = 7;
-            (*iface_ptr).method_count = 0;
-            (*iface_ptr).methods = std::ptr::null();
-            (*iface_ptr).event_count = 0;
-            (*iface_ptr).events = std::ptr::null();
-
-            // Build a fake wl_proxy on page 1 after the interface.
-            // Pad to keep 8-byte alignment.
-            let proxy_addr = page1 + core::mem::size_of::<wl_interface>();
-            let proxy_addr = (proxy_addr + 7) & !7;
-            let proxy_ptr = proxy_addr as *mut wl_proxy;
-            std::ptr::write_bytes(proxy_ptr, 0u8, 1);
-            (*proxy_ptr).object.interface = iface_ptr;
-
-            // Now munmap page 2 — the name string is gone.
-            let ret = libc::munmap(page2 as *mut c_void, page_size);
-            assert_eq!(ret, 0, "munmap failed");
-
-            // Reset the skip counter.
-            SWEEP_SKIPPED.store(0, Ordering::Relaxed);
-
-            // Install the guard — try_capture arms SWEEP_ARMED but does
-            // NOT install the signal handler (that's guarded_sweep's job).
-            install_guard();
-
-            // try_capture should fault → handler longjmps → returns false.
-            let ok = try_capture(proxy_ptr as *mut c_void);
-            assert!(!ok, "try_capture must return false for unmapped name");
-
-            let skipped = SWEEP_SKIPPED.load(Ordering::Relaxed);
-            assert_eq!(skipped, 1, "SWEEP_SKIPPED must be 1, got {skipped}");
-
-            // Uninstall the guard and clean up page 1.
-            uninstall_guard();
-            libc::munmap(page1 as *mut c_void, page_size);
+    fn handle_malformed_json() {
+        match handle_request("not json at all") {
+            HandleResult::Response(resp) => {
+                let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                assert_eq!(v["status"], "error");
+                assert_eq!(v["code"], "invalid_json");
+            }
+            other => panic!("expected Response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn handle_unknown_command() {
+        match handle_request(r#"{"type":"nonexistent_cmd"}"#) {
+            HandleResult::Response(resp) => {
+                let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                assert_eq!(v["status"], "error");
+                assert_eq!(v["code"], "unknown_command");
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_status_reports_state() {
+        // Set up minimal state for the status check.
+        let state = pump_state();
+        state.pump_running.store(true, Ordering::Release);
+        state.hijack_ok.store(true, Ordering::Release);
+        {
+            let mut s = state.sniffer.lock().unwrap();
+            s.set_object(7, ObjectKind::WlPointer);
+            s.set_object(8, ObjectKind::WlKeyboard);
+            s.set_object(5, ObjectKind::WlSurface);
+        }
+        state.next_serial.store(100, Ordering::Release);
+
+        match handle_request(r#"{"type":"status"}"#) {
+            HandleResult::Response(resp) => {
+                let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                assert_eq!(v["status"], "ok");
+                assert_eq!(v["pump_running"], true);
+                assert_eq!(v["pointer_id"], "7");
+                assert_eq!(v["keyboard_id"], "8");
+                assert_eq!(v["surface_id"], "5");
+                assert_eq!(v["hijack_ok"], true);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_surface_size_without_data() {
+        match handle_request(r#"{"type":"surface_size"}"#) {
+            HandleResult::Response(resp) => {
+                let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                assert_eq!(v["status"], "error");
+                assert_eq!(v["code"], "proxy_not_found");
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_surface_size_with_data() {
+        let state = pump_state();
+        state.surface_w.store(1920, Ordering::Release);
+        state.surface_h.store(1080, Ordering::Release);
+        match handle_request(r#"{"type":"surface_size"}"#) {
+            HandleResult::Response(resp) => {
+                let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                assert_eq!(v["status"], "ok");
+                assert_eq!(v["width"], 1920);
+                assert_eq!(v["height"], 1080);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+        state.surface_w.store(0, Ordering::Release);
+        state.surface_h.store(0, Ordering::Release);
     }
 }

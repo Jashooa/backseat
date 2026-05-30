@@ -24,7 +24,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use wayland_client::protocol::{
-    wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_surface,
+    wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -137,14 +137,20 @@ impl State {
         self.toplevel = Some(toplevel);
     }
 
-    /// Request fresh pointer and keyboard proxies so the payload can
-    /// capture them via its hooked `wl_proxy_add_dispatcher`.
+    /// Request fresh pointer and keyboard proxies.  Also sends a
+    /// wl_surface.frame request so the wire-rewrite payload's stream
+    /// sniffer can identify the surface object ID.
     fn force_request_input(&mut self, qh: &QueueHandle<Self>) {
         let Some(seat) = &self.seat else {
             return;
         };
         self.pointer = Some(seat.get_pointer(qh, ()));
         self.keyboard = Some(seat.get_keyboard(qh, ()));
+
+        // Expose the surface ID on the wire via wl_surface.frame (opcode 3).
+        if let Some(ref surface) = self.surface {
+            surface.frame(qh, ());
+        }
     }
 }
 
@@ -399,6 +405,18 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -443,7 +461,6 @@ fn main() {
         }
 
         if RESET_REQUESTED.swap(false, Ordering::SeqCst) {
-            // Reset internal state between tests.
             state.keyboard_focused = false;
             state.pointer_focused = false;
             print_event("EVENT: ready");
@@ -451,6 +468,10 @@ fn main() {
 
         if REREGISTER_INPUT.swap(false, Ordering::SeqCst) {
             state.force_request_input(&qh);
+            // Flush the queued get_pointer / get_keyboard / surface.frame
+            // messages so the wire-rewrite payload's stream sniffer can
+            // discover the object IDs.
+            let _ = event_queue.flush();
         }
 
         // Non-blocking dispatch with a short timeout so we can check
