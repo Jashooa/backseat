@@ -850,29 +850,47 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
         return;
     }
 
+    // Primary path: parse .rela.plt / .rela.dyn via goblin from the
+    // on-disk file.  This works for most modules including the Rust
+    // test fixture.
+    //
+    // FIXME: goblin returns empty pltrelocs for some PIE executables
+    // (the C test fixture).  The PT_DYNAMIC walk in
+    // patch_got_from_memory is the intended fix but currently causes
+    // a SIGSEGV during dlopen — needs debugging.
+    patch_got_via_goblin(base, path, symbol, hook);
+}
+
+/// Primary patching path using goblin.  Returns true if at least one
+/// GOT entry was found and patched.
+unsafe fn patch_got_via_goblin(
+    base: usize,
+    path: &str,
+    symbol: &str,
+    hook: *mut c_void,
+) -> bool {
     let data = match std::fs::read(path) {
         Ok(d) => d,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let elf = match goblin::Object::parse(&data) {
         Ok(goblin::Object::Elf(e)) => e,
-        _ => return,
+        _ => return false,
     };
 
-    // Compute load_bias: for PIE binaries r_offset is relative to the
-    // first PT_LOAD segment's p_vaddr.  Using base + r_offset directly
-    // only works when p_vaddr == 0 (typical modern PIE).  For ET_EXEC
-    // or PIE with non-zero p_vaddr, we must subtract p_vaddr.
     let load_bias = elf
         .program_headers
         .iter()
         .find(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD)
         .map_or(base, |ph| base.wrapping_sub(ph.p_vaddr as usize));
 
-    // Walk .rela.plt and .rela.dyn relocations.
     let relocs: Vec<_> = elf.pltrelocs.iter().chain(elf.dynrelas.iter()).collect();
+    if relocs.is_empty() {
+        return false;
+    }
 
+    let mut found = false;
     for rela in &relocs {
         let sym = match elf.dynsyms.get(rela.r_sym) {
             Some(s) => s,
@@ -884,20 +902,12 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
             continue;
         }
 
-        // Only patch imports (undefined symbols), not internal references.
         if sym.st_shndx as u32 != goblin::elf::section_header::SHN_UNDEF || sym.st_value != 0 {
             continue;
         }
 
         let got_entry = (load_bias + rela.r_offset as usize) as *mut *mut c_void;
 
-        // Resolve the real function pointer via dlsym instead of
-        // reading the GOT slot directly.  Under lazy binding an
-        // unresolved slot contains the PLT resolver stub, not the
-        // real function.  If we saved the stub as REAL and later
-        // called it, the resolver would write the resolved address
-        // back into the GOT — overwriting our hook and silently
-        // disabling it after the first call through the slot.
         let c_sym = std::ffi::CString::new(symbol).unwrap();
         let resolved = libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr());
         let real = if resolved.is_null() {
@@ -910,12 +920,10 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
         let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
         let page_start = (got_entry as usize) & !(page_size - 1);
         let old_prot = page_protection(page_start);
-
         if old_prot.is_none() {
             continue;
         }
 
-        // Make the page writable.
         let ret = libc::mprotect(
             page_start as *mut c_void,
             page_size,
@@ -925,17 +933,276 @@ unsafe fn patch_got_in_module(base: usize, path: &str, symbol: &str, hook: *mut 
             continue;
         }
 
-        // Write our hook.
         *got_entry = hook;
 
-        // Restore original protection.
         if let Some(prot) = old_prot {
             let _ = libc::mprotect(page_start as *mut c_void, page_size, prot);
         }
+        found = true;
+        break;
+    }
+    found
+}
 
+/// Walk the loaded ELF image at `base` to find and patch GOT entries
+/// for `symbol`.  Reads ELF structures directly from mapped memory.
+/// FIXME: disabled (unused) — triggers SIGSEGV during dlopen.
+#[allow(dead_code)]
+unsafe fn patch_got_from_memory(base: usize, symbol: &str, hook: *mut c_void) {
+    const PT_DYNAMIC: u32 = 2;
+    const PT_LOAD: u32 = 1;
+    const DT_NULL: i64 = 0;
+    const DT_STRTAB: i64 = 5;
+    const DT_SYMTAB: i64 = 6;
+    const DT_RELA: i64 = 7;
+    const DT_RELASZ: i64 = 8;
+    const DT_JMPREL: i64 = 23;
+    const DT_PLTRELSZ: i64 = 2;
+    const SHN_UNDEF: u16 = 0;
+    const STT_FUNC: u8 = 2;
+
+    // Check that the base page is readable before dereferencing.
+    if page_protection(base).is_none() {
         return;
     }
+
+    let ehdr = base as *const Elf64Ehdr;
+    // Verify 4-byte ELF magic.
+    if (*ehdr).e_ident.get(0..4) != Some(&[0x7f, b'E', b'L', b'F']) {
+        return;
+    }
+
+    // Find the first PT_LOAD to compute load_bias.
+    let phoff = (*ehdr).e_phoff as usize;
+    let phnum = (*ehdr).e_phnum as usize;
+    let phentsize = (*ehdr).e_phentsize as usize;
+
+    // Sanity-check program header counts to avoid walking garbage.
+    if phnum == 0 || phnum > 128 || phentsize < core::mem::size_of::<Elf64Phdr>() {
+        return;
+    }
+
+    let mut load_bias: isize = 0;
+    let mut dyn_vaddr: usize = 0;
+    let mut dyn_sz: usize = 0;
+
+    for i in 0..phnum {
+        let phdr = (base + phoff + i * phentsize) as *const Elf64Phdr;
+        match (*phdr).p_type {
+            PT_LOAD if load_bias == 0 => {
+                load_bias = base as isize - (*phdr).p_vaddr as isize;
+            }
+            PT_DYNAMIC => {
+                dyn_vaddr = (*phdr).p_vaddr as usize;
+                dyn_sz = (*phdr).p_memsz as usize;
+            }
+            _ => {}
+        }
+    }
+
+    if dyn_vaddr == 0 || dyn_sz == 0 || dyn_sz > 0x10000 {
+        return;
+    }
+
+    let dyn_start = (load_bias as usize + dyn_vaddr) as *const Elf64Dyn;
+    let dyn_count = dyn_sz / core::mem::size_of::<Elf64Dyn>();
+
+    let mut strtab: *const u8 = std::ptr::null();
+    let mut symtab: *const Elf64Sym = std::ptr::null();
+    let mut jmprel: *const Elf64Rela = std::ptr::null();
+    let mut jmprel_sz: usize = 0;
+    let mut rela: *const Elf64Rela = std::ptr::null();
+    let mut rela_sz: usize = 0;
+
+    for i in 0..dyn_count {
+        let d = dyn_start.add(i);
+        match (*d).d_tag {
+            DT_NULL => break,
+            DT_STRTAB => strtab = (load_bias as usize + (*d).d_val as usize) as *const u8,
+            DT_SYMTAB => symtab = (load_bias as usize + (*d).d_val as usize) as *const Elf64Sym,
+            DT_JMPREL => jmprel = (load_bias as usize + (*d).d_val as usize) as *const Elf64Rela,
+            DT_PLTRELSZ => jmprel_sz = (*d).d_val as usize,
+            DT_RELA => rela = (load_bias as usize + (*d).d_val as usize) as *const Elf64Rela,
+            DT_RELASZ => rela_sz = (*d).d_val as usize,
+            _ => {}
+        }
+    }
+
+    if strtab.is_null() || symtab.is_null() {
+        return;
+    }
+
+    // Cap relocation table sizes to avoid walking garbage.
+    let rela_entry_sz = core::mem::size_of::<Elf64Rela>();
+    if jmprel_sz > 0x10000 {
+        jmprel_sz = 0;
+    }
+    if rela_sz > 0x10000 {
+        rela_sz = 0;
+    }
+
+    let c_sym = std::ffi::CString::new(symbol).unwrap();
+    let target_bytes = symbol.as_bytes();
+
+    // Process .rela.plt (DT_JMPREL) first, then .rela.dyn (DT_RELA).
+    if !jmprel.is_null() && jmprel_sz > 0 {
+        let count = jmprel_sz / rela_entry_sz;
+        for i in 0..count {
+            let r = jmprel.add(i);
+            let sym_idx = ((*r).r_info >> 32) as u32;
+            let sym = symtab.add(sym_idx as usize);
+
+            let st_type = (*sym).st_info & 0xf;
+            if st_type != STT_FUNC {
+                continue;
+            }
+            if (*sym).st_shndx != SHN_UNDEF {
+                continue;
+            }
+
+            let name_ptr = strtab.add((*sym).st_name as usize);
+            let name = std::ffi::CStr::from_ptr(name_ptr as *const i8);
+            if name.to_bytes() != target_bytes {
+                continue;
+            }
+
+            apply_got_patch(load_bias, *r, symbol, &c_sym, hook);
+            return;
+        }
+    }
+    if !rela.is_null() && rela_sz > 0 {
+        let count = rela_sz / rela_entry_sz;
+        for i in 0..count {
+            let r = rela.add(i);
+            let sym_idx = ((*r).r_info >> 32) as u32;
+            let sym = symtab.add(sym_idx as usize);
+
+            let st_type = (*sym).st_info & 0xf;
+            if st_type != STT_FUNC {
+                continue;
+            }
+            if (*sym).st_shndx != SHN_UNDEF {
+                continue;
+            }
+
+            let name_ptr = strtab.add((*sym).st_name as usize);
+            let name = std::ffi::CStr::from_ptr(name_ptr as *const i8);
+            if name.to_bytes() != target_bytes {
+                continue;
+            }
+
+            apply_got_patch(load_bias, *r, symbol, &c_sym, hook);
+            return;
+        }
+    }
 }
+
+#[allow(dead_code)]
+unsafe fn apply_got_patch(
+    load_bias: isize,
+    r: Elf64Rela,
+    symbol: &str,
+    c_sym: &std::ffi::CString,
+    hook: *mut c_void,
+) {
+    let got_entry = (load_bias as usize + r.r_offset as usize) as *mut *mut c_void;
+
+    let resolved = libc::dlsym(libc::RTLD_DEFAULT, c_sym.as_ptr());
+    let real = if resolved.is_null() {
+        *got_entry
+    } else {
+        resolved
+    };
+    store_real(symbol, real);
+
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+    let page_start = (got_entry as usize) & !(page_size - 1);
+    let old_prot = page_protection(page_start);
+    if old_prot.is_none() {
+        return;
+    }
+
+    let ret = libc::mprotect(
+        page_start as *mut c_void,
+        page_size,
+        libc::PROT_READ | libc::PROT_WRITE,
+    );
+    if ret != 0 {
+        return;
+    }
+
+    *got_entry = hook;
+
+    if let Some(prot) = old_prot {
+        let _ = libc::mprotect(page_start as *mut c_void, page_size, prot);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 structures for direct memory reading
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[allow(dead_code)]
+struct Elf64Ehdr {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct Elf64Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct Elf64Dyn {
+    d_tag: i64,
+    d_val: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Elf64Rela {
+    r_offset: u64,
+    r_info: u64,
+    r_addend: i64,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct Elf64Sym {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+}
+
+// End of ELF64 structures
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Synthetic input dispatch — calls the proxy's dispatcher directly.
