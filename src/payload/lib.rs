@@ -1327,8 +1327,11 @@ fn handle_request(line: &str) -> HandleResult {
             HandleResult::Response(format!(r#"{{"status":"ok","width":{},"height":{}}}"#, w, h))
         }
         "status" => HandleResult::Response(format!(
-            r#"{{"status":"ok","dispatch_hook_installed":{}}}"#,
-            G_DISPATCH_CALLED.load(Ordering::Acquire)
+            r#"{{"status":"ok","dispatch_hook_installed":{},"poll_hits":{},"eventfd":{},"has_poll_real":{}}}"#,
+            G_DISPATCH_CALLED.load(Ordering::Acquire),
+            POLL_HOOK_COUNT.load(Ordering::Relaxed),
+            WAKE_EVENTFD.load(Ordering::Acquire),
+            REAL_POLL.load(Ordering::Acquire) != 0,
         )),
         "unload" => HandleResult::Unload,
         _ => HandleResult::Response(make_error("unknown_command", &req.ty)),
